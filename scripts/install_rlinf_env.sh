@@ -2,10 +2,9 @@
 # Install a named RLinf environment with all caches kept under this repository.
 #
 # Usage:
-#   source scripts/install_rlinf_env.sh <env_name> embodied --model openpi --env maniskill_libero
+#   bash scripts/install_rlinf_env.sh <env_name> embodied --model openpi --env maniskill_libero
 #
 # Examples:
-#   source scripts/install_rlinf_env.sh pirl embodied --model openpi --env maniskill_libero --no-root
 #   bash scripts/install_rlinf_env.sh pirl embodied --model openpi --env maniskill_libero --no-root
 #
 # Directory layout:
@@ -21,29 +20,36 @@
 #
 # Optional:
 #   export LIBERO_PATH=/path/to/LIBERO
-#   source scripts/install_rlinf_env.sh pirl embodied --model openpi --env maniskill_libero
+#   bash scripts/install_rlinf_env.sh pirl embodied --model openpi --env maniskill_libero
 #
 # If system dependency installation blocks on sudo:
-#   source scripts/install_rlinf_env.sh pirl embodied --model openpi --env maniskill_libero --no-root
-
-set -euo pipefail
+#   bash scripts/install_rlinf_env.sh pirl embodied --model openpi --env maniskill_libero --no-root
 
 is_sourced() {
     [[ "${BASH_SOURCE[0]}" != "$0" ]]
 }
 
+if is_sourced; then
+    echo "[install_rlinf_env] Run this script with bash, not source:" >&2
+    echo "  bash scripts/install_rlinf_env.sh <env_name> <target> [install.sh options]" >&2
+    echo "[install_rlinf_env] After installation, activate the venv with:" >&2
+    echo "  source .venvs/<env_name>/bin/activate" >&2
+    return 1
+fi
+
+set -euo pipefail
+
 print_usage() {
     cat <<'EOF'
 Usage:
-  source scripts/install_rlinf_env.sh <env_name> <target> [install.sh options]
   bash scripts/install_rlinf_env.sh <env_name> <target> [install.sh options]
 
 Examples:
-  source scripts/install_rlinf_env.sh pirl embodied --model openpi --env maniskill_libero --no-root
   bash scripts/install_rlinf_env.sh pirl embodied --model openpi --env maniskill_libero --no-root
 
 Notes:
-  Use "source" if you want the environment activated in the current shell after installation.
+  After installation, activate the environment with:
+    source .venvs/<env_name>/bin/activate
 EOF
 }
 
@@ -75,9 +81,6 @@ strip_venv_args() {
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -lt 2 ]]; then
     print_usage
-    if is_sourced; then
-        return 0
-    fi
     exit 0
 fi
 
@@ -89,9 +92,6 @@ RLINF_ROOT="${RLINF_ROOT:-$ROOT}"
 if [[ ! -f "$RLINF_ROOT/requirements/install.sh" ]]; then
     echo "[install_rlinf_env] RLinf install script not found: $RLINF_ROOT/requirements/install.sh" >&2
     echo "[install_rlinf_env] Set RLINF_ROOT to the RLinf repository root if needed." >&2
-    if is_sourced; then
-        return 1
-    fi
     exit 1
 fi
 
@@ -126,10 +126,12 @@ export XDG_CACHE_HOME="$CACHE_ROOT/xdg"
 export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-$ROOT/.cache/openpi}"
 export RLINF_CHECKPOINT_HOME="${RLINF_CHECKPOINT_HOME:-$CHECKPOINT_ROOT}"
 
-# Mainland China friendly defaults. Users can export their own values before
-# running this script to override them.
+# Workspace-friendly defaults. Users can export their own values before running
+# this script to override them. Keep Hugging Face on the official endpoint by
+# default because mirror endpoints can miss Hub metadata headers required by
+# huggingface_hub.
 export UV_INDEX_URL="${UV_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}"
-export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
 export GIT_LFS_SKIP_SMUDGE="${GIT_LFS_SKIP_SMUDGE:-1}"
 
 mkdir -p \
@@ -172,20 +174,9 @@ fi
 
 if [[ ! -f "$VENV_PATH/bin/activate" ]]; then
     echo "[install_rlinf_env] install finished, but activate script was not found: $VENV_PATH/bin/activate" >&2
-    if is_sourced; then
-        return 1
-    fi
     exit 1
 fi
 
-if is_sourced; then
-    # shellcheck source=/dev/null
-    source "$VENV_PATH/bin/activate"
-    echo "[install_rlinf_env] activated: $VENV_PATH"
-else
-    echo "[install_rlinf_env] installed: $VENV_PATH"
-    echo "[install_rlinf_env] To activate in your current shell, run:"
-    echo "  source $VENV_PATH/bin/activate"
-    echo "[install_rlinf_env] Or install+activate in one command next time:"
-    echo "  source scripts/install_rlinf_env.sh $NAMED_ENV ${INSTALL_ARGS[*]}"
-fi
+echo "[install_rlinf_env] installed: $VENV_PATH"
+echo "[install_rlinf_env] To activate in your current shell, run:"
+echo "  source $VENV_PATH/bin/activate"
