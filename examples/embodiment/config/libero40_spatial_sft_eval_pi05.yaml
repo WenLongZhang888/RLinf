@@ -93,7 +93,7 @@ env:
     max_episode_steps: 240 # max episode steps for truncation
     max_steps_per_rollout_epoch: 240
   eval:
-    seed: 0
+    seed: 1
     total_num_envs: 25
     auto_reset: True
     ignore_terminations: True

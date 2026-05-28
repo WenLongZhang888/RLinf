@@ -15,7 +15,7 @@
 import asyncio
 import gc
 from collections import defaultdict
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import numpy as np
 import torch
@@ -217,7 +217,7 @@ class EnvWorker(Worker):
             tokens_list.append(tokens)
             masks_list.append(mask)
         import numpy as np
-        return {
+        result = {
             "tokenized_prompt": torch.from_numpy(
                 np.stack(tokens_list, axis=0)
             ).to(dtype=torch.long),
