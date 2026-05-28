@@ -84,6 +84,14 @@ class OpenPi0Config(Pi0Config):
         default_factory=lambda: (128, 128, 128)
     )  # Hidden dims for Q-head and GaussianPolicy
 
+    # ======QAM-specific parameters======
+    use_qam: bool = False
+    qam_num_q_heads: int = 2
+    qam_q_hidden_dims: tuple=field(
+        default_factory=lambda:(512,512)
+    )
+    qam_pool_mode: str = "mean_token"  # mean_token, last_token, first_token
+
     # ===== NFT-specific parameters =====
     is_nft: bool = False
 
@@ -236,10 +244,150 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 output_dim=1,
             ).to(dtype=_dsrl_dtype)
 
+        if self.config.use_qam:
+            if self.config.use_dsrl:
+                raise ValueError("use_qam and use_dsrl are mutually exclusive.")
+            
+            from rlinf.models.embodiment.modules.q_head import MultiQHead
+            _qam_dtype = torch.bfloat16
+            pooled_z_dim = 2048 if "pi05_" in self.config.config_name else 1024
+            action_feature_dim = (
+                self.config.action_horizon*self.config.action_env_dim
+            )
+            self.q_head_qam = MultiQHead(
+                hidden_size = pooled_z_dim,
+                action_feature_dim=action_feature_dim,
+                hidden_dims=list(self.config.qam_q_hidden_dims),
+                num_q_heads=self.config.qam_num_q_heads,
+                output_dim=1,
+                train_action_encoder=False,
+            ).to(dtype=_qam_dtype)
+
         for name, module in self.named_modules():
             # Set _fsdp_wrap_name to the last part of the path (e.g., "model.action_in_proj" -> "action_in_proj")
             path_parts = name.split(".")
             setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
+
+    def _obs_processor_for_qam(self, replay_obs):
+        """Replay-side equivalent of obs_processor.
+
+        Replay transitions carry ``tokenized_prompt + tokenized_prompt_mask``
+        (added by env_worker in P1) instead of raw ``task_descriptions``
+        strings (those are popped by Transitions.append_transitions to keep
+        the obs dict tensor-only). This helper produces the same
+        ``observation/*`` layout as obs_processor, then attaches the
+        pre-tokenized language so ``input_transform`` picks it up via its
+        not-first-process branch.
+        """
+        processed_obs = {
+            "observation/image": replay_obs["main_images"],
+            "tokenized_prompt": replay_obs["tokenized_prompt"],
+            "tokenized_prompt_mask": replay_obs["tokenized_prompt_mask"],
+        }
+        if "calvin" in self.config.config_name:
+            state = replay_obs["states"]
+            processed_obs["observation/state_ee_pos"] = state[:, :3]
+            processed_obs["observation/state_ee_rot"] = state[:, 3:6]
+            processed_obs["observation/state_gripper"] = state[:, 6:7]
+        else:
+            processed_obs["observation/state"] = replay_obs["states"]
+        if replay_obs.get("wrist_images") is not None:
+            processed_obs["observation/wrist_image"] = replay_obs["wrist_images"]
+        if replay_obs.get("extra_view_images") is not None:
+            processed_obs["observation/extra_view_image"] = (
+                replay_obs["extra_view_images"]
+            )
+        return processed_obs
+
+    def _pool_prefix_for_qam(self, prefix_output: torch.Tensor) -> torch.Tensor:
+        """Pool PaliGemma prefix into [B, hidden] for QAM critic input."""
+        if "pi05_" in self.config.config_name:
+            lang_token_len = 200
+            all_token_length = 968
+        elif "pi0_" in self.config.config_name:
+            lang_token_len = 48
+            all_token_length = 816
+        else:
+            raise ValueError(f"unknown config_name {self.config.config_name!r}")
+
+        mode = self.config.qam_pool_mode
+        if mode == "mean_token":
+            prefix_mask = (
+                [True] * 256 * self.config.num_images_in_input
+                + [False] * 256 * (3 - self.config.num_images_in_input)
+                + [True] * lang_token_len
+            )
+        elif mode == "last_token":
+            prefix_mask = [False] * (all_token_length - 1) + [True]
+        elif mode == "first_token":
+            prefix_mask = [True] + [False] * (all_token_length - 1)
+        else:
+            raise ValueError(f"unknown qam_pool_mode {mode!r}")
+
+        return prefix_output[:, prefix_mask, :].mean(dim=1, keepdim=False)
+
+
+    def qam_q_forward(
+        self,
+        obs=None,
+        actions=None,
+        data=None,
+        detach_vlm: bool = True,
+        train: bool = False,
+        **kwargs,
+    ):
+        """Critic forward Q_φ(z_t, action_chunk) for plain QAM.
+
+        Pipeline mirrors predict_action_batch but on replay obs (no raw
+        ``task_descriptions`` strings — uses cached tokenized_prompt):
+
+            replay_obs
+            └─ _obs_processor_for_qam     # main_images → observation/image, etc.
+            └─ input_transform            # not-first-process branch
+            └─ precision_processor        # to device, contiguous
+            └─ _model.Observation.from_dict
+            └─ _preprocess_observation    # split to 5 tensors
+            └─ _build_prefix_cache        # PaliGemma forward
+            └─ detach                     # freeze VLM grads (LWD V1 plan)
+            └─ _pool_prefix_for_qam       # [B, hidden]
+            └─ q_head_qam(z_t, action)    # [B, num_q_heads]
+
+        Args:
+            obs: replay-format dict (main_images, states,
+                tokenized_prompt, tokenized_prompt_mask, ...).
+            actions: [B, H*A] or [B, H, A].
+            detach_vlm: True (default) — plain QAM requires VLM frozen.
+        """
+        if not self.config.use_qam:
+            raise ValueError("qam_q_forward called but use_qam=False")
+
+        if obs is None:
+            obs = data.get("obs", data) if data is not None else kwargs.get("obs", {})
+        if actions is None:
+            actions = kwargs.get("actions")
+        assert actions is not None, "qam_q_forward requires `actions`"
+
+        to_process_obs = self._obs_processor_for_qam(obs)
+        processed_obs = self.input_transform(to_process_obs, transpose=False)
+        processed_obs = self.precision_processor(processed_obs)
+        observation = _model.Observation.from_dict(processed_obs)
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+
+        prefix_output, _, _ = self._build_prefix_cache(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        if detach_vlm:
+            prefix_output = prefix_output.detach()
+
+        pooled_z = self._pool_prefix_for_qam(prefix_output)  # [B, hidden]
+
+        if actions.dim() == 3:
+            actions = actions.reshape(actions.shape[0], -1)
+        actions = actions.to(device=pooled_z.device, dtype=pooled_z.dtype)
+
+        return self.q_head_qam(pooled_z, actions)  # [B, num_q_heads]
 
     def set_global_step(self, global_step):
         self.global_step = global_step
@@ -322,6 +470,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             return self.sac_forward(**kwargs)
         elif forward_type == ForwardType.SAC_Q:
             return self.sac_q_forward(**kwargs)
+        elif forward_type == ForwardType.QAM_Q:
+            return self.qam_q_forward(**kwargs)
         else:
             raise NotImplementedError
 
