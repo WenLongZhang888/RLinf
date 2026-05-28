@@ -169,6 +169,63 @@ class EnvWorker(Worker):
                 ]
                 self.history_lengths = [{} for _ in range(self.stage_num)]
 
+        self._maybe_init_language_tokenizer()
+
+
+    def _maybe_init_language_tokenizer(self) -> None:
+        if getattr(self, "_language_tokenizer", None) is not None:
+            return
+        self._language_tokenizer = None
+        if not self.collect_transitions:
+            return
+        model_type = self.cfg.actor.model.get("model_type", None)
+        if model_type != "openpi":
+            # Other models don't expect ``tokenized_prompt`` — skip silently.
+            return
+        try:
+            from openpi.models.tokenizer import PaligemmaTokenizer
+        except ImportError:
+            self.log_warning(
+                "collect_transitions=True but openpi.models.tokenizer is not "
+                "importable in env_worker; replay will not contain tokenized "
+                "language."
+            )
+            return
+        max_len = int(
+            self.cfg.actor.model.get("paligemma_max_token_len", 48)
+        )
+        self._language_tokenizer = PaligemmaTokenizer(max_len=max_len)
+        self.log_info(
+            f"env_worker: PaligemmaTokenizer initialized (max_len={max_len})."
+        )
+
+    def _tokenize_language(
+        self, task_descriptions
+    ) -> Optional[dict[str, torch.Tensor]]:
+        tokenizer = getattr(self, "_language_tokenizer", None)
+        if tokenizer is None or task_descriptions is None:
+            return None
+        if len(task_descriptions) == 0:
+            return None
+        tokens_list = []
+        masks_list = []
+        for prompt in task_descriptions:
+            # PaligemmaTokenizer.tokenize returns (np.ndarray[L], np.ndarray[L]).
+            # State is None — Pi05 LIBERO uses discrete_state_input=False
+            # (see rlinf/models/embodiment/openpi/dataconfig/__init__.py).
+            tokens, mask = tokenizer.tokenize(str(prompt), state=None)
+            tokens_list.append(tokens)
+            masks_list.append(mask)
+        import numpy as np
+        return {
+            "tokenized_prompt": torch.from_numpy(
+                np.stack(tokens_list, axis=0)
+            ).to(dtype=torch.long),
+            "tokenized_prompt_mask": torch.from_numpy(
+                np.stack(masks_list, axis=0)
+            ).to(dtype=torch.bool),
+        }
+
     def update_env_cfg(self):
         if not self.only_eval:
             # train env
@@ -1117,8 +1174,14 @@ class EnvWorker(Worker):
                             if env_output.dones.any() and self.cfg.env.train.auto_reset
                             else env_output.obs
                         )
+                        curr_language = self._tokenize_language(
+                            curr_obs.get("task_descriptions")
+                        )
+                        next_language = self._tokenize_language(
+                            next_obs.get("task_descriptions")
+                        )
                         self.rollout_results[stage_id].append_transitions(
-                            curr_obs, next_obs
+                            curr_obs, next_obs, curr_language, next_language
                         )
 
                     env_outputs[stage_id] = env_output

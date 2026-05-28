@@ -1,198 +1,58 @@
-# LWD 实现计划
+# QAM 实现
 
-本文档用于记录 RLinf 中 LWD 相关功能的计划实现范围。它是 `lwd` 分支上的工作设计笔记，后续应随着算法细节和代码实现逐步更新。
+## P1：保留 task language 进 replay
 
-## 目标
+### 解决的问题
 
-- 在 `rlinf/algorithms/lwd/` 下新增 LWD 算法工具。
-- 为 embodied policy 新增分布式 critic、QAM actor 和 action adapter 模块。
-- 通过专用 action model 和 factory 将 LWD 接入 OpenPI。
-- 新增可训练 LWD policy 路径的 FSDP actor worker。
-- 提供 LIBERO spatial OpenPI PI0.5 训练配置和 SFT 示例配置。
-- 通过聚焦的单元测试覆盖算法逻辑和模型行为。
+QAM critic 训练时要在 replay 上重算 `z_t = pool(PaliGemma_prefix(s_t))`，但原代码 `EmbodiedRolloutResult.append_transitions` 把 `task_descriptions` 字符串直接 pop 丢掉，replay 里没有语言条件，PaliGemma 没法跑。
 
-TODO(agent): 在锁定公开命名和文档表述前，确认 LWD 的完整含义以及论文级定义。
+### 思路
 
-## 计划文件
+**rollout 自己 tokenize 是给当下推理用的，用完即丢，不回传**。所以 env_worker 在每一帧收集 transition 时**自己再 tokenize 一次**写进 replay，把 `task_descriptions: list[str]` 换成等价的 `tokenized_prompt + tokenized_prompt_mask` 张量。
 
-### 算法
+### 改了哪些文件
 
-- `rlinf/algorithms/lwd/__init__.py`
-- `rlinf/algorithms/lwd/divl.py`
-- `rlinf/algorithms/lwd/qam.py`
-- `rlinf/algorithms/lwd/targets.py`
-- `rlinf/algorithms/lwd/projection.py`
+| 文件 | 改动 |
+|---|---|
+| `rlinf/data/embodied_io_struct.py` | `append_transitions` 签名加 `curr_language` / `next_language` 两个可选 dict；pop 掉 string 后 attach tokenized 张量 |
+| `rlinf/workers/env/env_worker.py` | 新增 `_maybe_init_language_tokenizer`（`init_worker` 末尾调用，仅 `collect_transitions=True` 且 `model_type ∈ {openpi, openpi_pi05}` 时载入 PaliGemma tokenizer） |
+| `rlinf/workers/env/env_worker.py` | 新增 `_tokenize_language(strings)`，返回 dict 或 None |
+| `rlinf/workers/env/env_worker.py` | chunk-step 调用 `append_transitions` 处分别对 `curr_obs` / `next_obs` 的 `task_descriptions` 各 tokenize 一次，传入 |
+| `tests/data/test_append_transitions_language.py` | 新增 5 个单测 |
 
-### 模型模块
+### 数据契约（每帧 `append_transitions` 写进 list 的 dict）
 
-- `rlinf/models/embodiment/modules/lwd_distributional_critic.py`
-- `rlinf/models/embodiment/modules/lwd_qam_actor.py`
-- `rlinf/models/embodiment/modules/lwd_action_adapter.py`
-
-### OpenPI 集成
-
-- `rlinf/models/embodiment/openpi/lwd_openpi_action_model.py`
-- `rlinf/models/embodiment/openpi/lwd_factory.py`
-
-### Worker
-
-- `rlinf/workers/actor/fsdp_lwd_policy_worker.py`
-
-### 配置
-
-- `examples/embodiment/config/libero_spatial_lwd_openpi_pi05.yaml`
-- `examples/sft/config/libero_sft_openpi_pi05.yaml`
-
-### 测试
-
-- `tests/algorithms/lwd/test_divl.py`
-- `tests/algorithms/lwd/test_qam.py`
-- `tests/algorithms/lwd/test_targets.py`
-- `tests/algorithms/lwd/test_projection.py`
-- `tests/models/embodiment/openpi/test_lwd_openpi_action_model.py`
-
-## 组件职责
-
-### `divl.py`
-
-放置 actor/critic 训练中使用的主要 LWD loss 或 divergence 工具函数。输入应当是 worker 已经整理好的 tensor，并且需要显式处理 shape 检查和 mask 逻辑。
-
-TODO(agent): 检查 actor worker 调用点和 LWD 原始公式后，再定义精确的函数签名。
-
-### `qam.py`
-
-包含 QAM 相关的 actor objective 或 scoring helper。这里应尽量只保留纯 tensor 逻辑，使其可以脱离 OpenPI 和 FSDP 单独测试。
-
-TODO(agent): 确认当前实现中的 QAM 是 policy head、action mixture transform，还是训练目标。
-
-### `targets.py`
-
-为 distributional critic 构造 target distribution 或 bootstrapped target。该模块应尽量避免模型特定假设。
-
-### `projection.py`
-
-将 target distribution 投影到 critic support 上。投影实现需要数值稳定、向量化，并通过边界条件测试覆盖。
-
-### `lwd_distributional_critic.py`
-
-定义 critic head/module，包括 support 参数、logits/value 转换，以及 worker 需要调用的辅助方法。
-
-### `lwd_qam_actor.py`
-
-定义 actor 侧的 QAM 模块。该模块应暴露尽量窄的接口，供 OpenPI 集成层调用，避免重复实现 tensor 转换逻辑。
-
-### `lwd_action_adapter.py`
-
-负责 OpenPI action 表示、环境 action，以及 LWD distributional/QAM 专用 action 格式之间的转换。
-
-### `lwd_openpi_action_model.py`
-
-在 OpenPI action generation 外层封装 LWD 专用的 actor/critic 输出。该文件应把 OpenPI 相关 wiring 留在集成层，避免污染通用算法模块。
-
-### `lwd_factory.py`
-
-提供 OpenPI LWD model、processor、adapter 和 critic module 的构造辅助函数。优先沿用仓库中已有的 OpenPI factory 风格。
-
-### `fsdp_lwd_policy_worker.py`
-
-负责 LWD policy 的 FSDP 训练路径。worker 应调用共享的 LWD 算法模块，而不是把 loss 数学逻辑直接写在 worker 代码中。
-
-## 集成注意事项
-
-- 只有当新的算法入口需要通过配置选择时，才将其注册到 RLinf 现有 registry。
-- 对 OpenPI 或环境特定依赖保持 lazy import，避免用户安装其他 RLinf target 时在 import 阶段失败。
-- 只有当新配置引入无法在局部捕获的用户可见约束时，才在 `rlinf/config.py` 中增加校验。
-- 面向用户的配置应使用静态 YAML 值，不要依赖代码中的计算型默认值。
-- 公开 API 应包含类型注解和 Google-style docstring。
-
-## Fork 维护流程
-
-本仓库预期基于 fork 进行开发。保持 `origin` 指向自己的 fork，并将官方 RLinf 仓库添加为 `upstream`。
-
-同步上游代码前，建议先提交或 stash 本地修改，保持工作区干净：
-
-```bash
-git status
-git add docs/lwd.md docs/lwd_exp.md
-git commit -s -m "docs: add lwd planning notes"
+```
+{
+  main_images:           Tensor[B, ...]
+  states:                Tensor[B, ...]
+  # task_descriptions 已被 pop
+  tokenized_prompt:      Tensor[B, 48]  long   ← 新增
+  tokenized_prompt_mask: Tensor[B, 48]  bool   ← 新增
+}
 ```
 
-检查 remote：
+`to_trajectory()` 后 stack 成 `[T, B, 48]` 进 replay。
 
+### 关键设计点
+
+- **每帧都 tokenize**，不是 episode 结束才做。原因：QAM 训练 sample 的是单帧 transition，每帧必须自带语言；且 auto-reset 后 next_obs 可能是新任务，必须 `curr_language` / `next_language` 分别 tokenize。
+- **PaliGemma tokenizer 在 env_worker 进程内 lazy-init**：CPU 上 SentencePiece，单 prompt < 1ms，可忽略。
+- **`max_len=48`** 与 OpenPI 官方一致；可通过 `actor.model.paligemma_max_token_len` 配置覆盖。
+- **`state=None`**：本仓库 Pi05 LIBERO config 全部 `discrete_state_input=False`。
+
+### 向后兼容
+非 OpenPI 路径完全不动，三道闸门保护：
+1. `collect_transitions=False` → tokenizer 不载入；
+2. `model_type` 非 openpi → tokenizer 不载入；
+3. `curr_language=None` → `append_transitions` 内 attach 跳过。
+
+→ OpenVLA / GR00T / MLP / SAC / PPO / GRPO 路径不受影响。
+
+### 验证
 ```bash
-git remote -v
+pytest tests/data/test_append_transitions_language.py -v
 ```
 
-首次添加 upstream：
-
-```bash
-git remote add upstream git@github.com:RLinf/RLinf.git
-```
-
-如果没有配置 SSH，也可以使用 HTTPS：
-
-```bash
-git remote add upstream https://github.com/RLinf/RLinf.git
-```
-
-拉取 fork 和 upstream 的最新引用：
-
-```bash
-git fetch origin
-git fetch upstream
-```
-
-用 upstream 更新本地 `main` 分支，并推回自己的 fork：
-
-```bash
-git checkout main
-git pull --ff-only upstream main
-git push origin main
-```
-
-把 upstream `main` 的最新变化合入 LWD 分支：
-
-```bash
-git checkout lwd
-git merge upstream/main
-```
-
-如果出现冲突，解决后完成 merge：
-
-```bash
-git status
-git add <resolved_files>
-git commit
-```
-
-将更新后的 LWD 分支推送到自己的 fork：
-
-```bash
-git push origin lwd
-```
-
-如果希望分支历史更线性，也可以使用 rebase 流程：
-
-```bash
-git checkout lwd
-git rebase upstream/main
-git push --force-with-lease origin lwd
-```
-
-如果更重视保留分支历史，优先使用 merge。只有当该分支是个人分支，或协作者都同意重写历史时，才使用 rebase。
-
-## 测试策略
-
-- 使用小规模、确定性的 tensor 测试 LWD 算法函数。
-- 覆盖 shape、dtype、device、mask 和边界值场景。
-- 测试 support 边界和精确 atom 边界处的 projection 行为。
-- OpenPI action model 测试应使用轻量 mock，避免加载完整 checkpoint。
-- GPU 或重量级集成测试应添加合适的 skip 标记。
-
-## 待确认问题
-
-- 文档中应使用哪一个精确的 LWD objective 和符号体系？
-- 应使用哪个 config key 选择 LWD worker 路径？
-- Distributional critic 是否与 OpenPI trunk 共享参数，还是使用独立模块？
-- 哪些指标应记录到 `train/`、`eval/` 和 `loss/` namespace？
-- 初始目标是否只需要覆盖 LIBERO spatial 和 OpenPI PI0.5？
+### 下一步（P2）
+在 `OpenPi0ForRLActionPrediction` 加 `qam_q_forward`：从 `curr_obs` 取 `tokenized_prompt` + images + states → `_build_prefix_cache` → pool → `z_t` → `Q_head(z_t, action_chunk)`。

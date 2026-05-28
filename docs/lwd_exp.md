@@ -3,12 +3,14 @@
 本文档记录 RLinf 上 LWD 的计划实验流程。它是当前分支内的实验规划文件，后续应在实现和配置落地后继续修订。
 
 ## Baseline
+
 - sft 训练实验：chunk10 seed0 libero40 20260527 在OpenPI官方仓库进行训练
 - 单卡H200 batch_size为32
 - 抽取的40条数据序号为：36, 37, 54, 87, 128, 133, 139, 331, 340, 362,
                     407, 432, 445, 481, 489, 505, 516, 553, 644, 746,
-                    825, 882, 886, 904, 907, 946, 1082, 1093, 1199, 1284,
-                    1325, 1329, 1372, 1408, 1426, 1449, 1555, 1626, 1659
+                    845，825, 882, 886, 904, 907, 946, 1082, 1093, 1199，
+                    1284,1325, 1329, 1372, 1408, 1426, 1449, 1555, 1626，1659，
+
 ```bash
 export HF_LEROBOT_HOME=/mnt/kpfs/zhangwenlong/openpi/.cache/openpi/datasets
 export OPENPI_DATA_HOME=/mnt/kpfs/zhangwenlong/openpi/.cache/openpi
@@ -58,7 +60,7 @@ done
 
 | 日期 | 任务环境 | seed | chunk | num_steps | 并行环境 | eval epoch | 配置名 | Checkpoint | 结果 | 备注 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2026-05-27 | libero_spatial | 0 | 5 | 10 | 50 | 10 | libero40_spatial_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **84.8%** / success_at_end **75.4%** | 500 traj；episode_len=240 |
-| 2026-05-27 | libero_goal | 0 | 5 | 10 | 50 | 10 | libero40_goal_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **75.6%** / success_at_end **65.6%** | 500 traj；episode_len=320 |
-| 2026-05-27 | libero_object | 0 | 5 | 10 | 50 | 10 | libero40_object_sft_eval_pi05 | pi05_libero_40_sft_pytorch | OOM，未完成 | 500 traj 目标；80% epoch 时 Ray 内存 214/225GB |
-| 2026-05-27 | libero_10 | 0 | 10 | 10 | 50 | 10 | libero40_10_sft_eval_pi05 | pi05_libero_40_sft_pytorch | OOM，未完成 | 500 traj 目标；40% epoch 时 Ray 内存 215/225GB；episode_len=480 |
+| 2026-05-28 | libero_spatial | 0 | 5 | 10 | 50 | 10 | libero40_spatial_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **83.8%** / success_at_end **76.0%** | 500 traj；episode_len=240 |
+| 2026-05-28 | libero_goal | 0 | 5 | 10 | 50 | 10 | libero40_goal_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **74.6%** / success_at_end **64.6%** | 500 traj；episode_len=320 |
+| 2026-05-28 | libero_object | 0 | 5 | 10 | 50 | 10 | libero40_object_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **74.6%** / success_at_end **74.4%** | 500 traj；episode_len=240 |
+| 2026-05-28 | libero_10 | 0 | 10 | 10 | 50 | 10 | libero40_10_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **45.4%** / success_at_end **34.0%** | 500 traj；episode_len=480 |

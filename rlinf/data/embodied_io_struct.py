@@ -17,6 +17,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+from rlinf.utils.nested_dict_process import (
+    cat_list_of_dict_tensor,
+    copy_dict_tensor,
+    put_tensor_device,
+    split_dict_to_chunk,
+    stack_list_of_dict_tensor,
+)
 
 if TYPE_CHECKING:
     pass
@@ -619,13 +626,25 @@ class EmbodiedRolloutResult:
                         last_full_action.reshape(bsz, -1).cpu().contiguous()
                     )
                 last_fi.pop("model_action", None)
-
-    def append_transitions(self, curr_obs=None, next_obs=None):
+                
+    def append_transitions(self, curr_obs=None, next_obs=None, curr_language=None, next_language=None):
         assert curr_obs is not None and next_obs is not None
-        if "task_descriptions" in curr_obs:
-            curr_obs.pop("task_descriptions")
-        if "task_descriptions" in next_obs:
-            next_obs.pop("task_descriptions")
+        curr_obs = copy_dict_tensor(curr_obs)
+        next_obs = copy_dict_tensor(next_obs)
+
+        curr_obs.pop("task_descriptions", None)
+        next_obs.pop("task_descriptions", None)
+
+        def _attach(target: dict, source: Optional[dict]) -> None:
+            if source is None:
+                return
+            for key in ("tokenized_prompt", "tokenized_prompt_mask"):
+                if key in source:
+                    target[key] = source[key].detach().cpu().contiguous()
+
+        _attach(curr_obs, curr_language)
+        _attach(next_obs, next_language)
+
         self.curr_obs.append(curr_obs)
         self.next_obs.append(next_obs)
 
