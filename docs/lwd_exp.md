@@ -60,7 +60,7 @@ done
 
 | 日期 | 任务环境 | seed | chunk | num_steps | 并行环境 | eval epoch | 配置名 | Checkpoint | 结果 | 备注 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2026-05-28 | libero_spatial | 0 | 5 | 10 | 50 | 10 | libero40_spatial_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **83.8%** / success_at_end **76.0%** | 500 traj；episode_len=240 |
-| 2026-05-28 | libero_goal | 0 | 5 | 10 | 50 | 10 | libero40_goal_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **74.6%** / success_at_end **64.6%** | 500 traj；episode_len=320 |
-| 2026-05-28 | libero_object | 0 | 5 | 10 | 50 | 10 | libero40_object_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **74.6%** / success_at_end **74.4%** | 500 traj；episode_len=240 |
-| 2026-05-28 | libero_10 | 0 | 10 | 10 | 50 | 10 | libero40_10_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **45.4%** / success_at_end **34.0%** | 500 traj；episode_len=480 |
+| 2026-05-28 | libero_spatial | 0 | 5 | 10 | 50 | 10 | libero40_spatial_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **84.8%** / success_at_end **76.6%** | 500 traj；episode_len=240 |
+| 2026-05-28 | libero_goal | 0 | 5 | 10 | 50 | 10 | libero40_goal_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **75.8%** / success_at_end **64.8%** | 500 traj；episode_len=320 |
+| 2026-05-28 | libero_object | 0 | 5 | 10 | 50 | 10 | libero40_object_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **76.6%** / success_at_end **76.4%** | 500 traj；episode_len=240 |
+| 2026-05-28 | libero_10 | 0 | 10 | 10 | 50 | 10 | libero40_10_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **46.2%** / success_at_end **31.0%** | 500 traj；episode_len=480 |

@@ -204,3 +204,69 @@ def test_pool_prefix_unknown_config_name_raises():
     prefix = torch.randn(2, 968, 2048)
     with pytest.raises(ValueError, match="config_name"):
         OpenPi0ForRLActionPrediction._pool_prefix_for_qam(mock, prefix)
+
+
+# ============ snapshot_f_beta (P3.1) ============
+
+
+class _MockExpertHolder(torch.nn.Module):
+    """Minimal stand-in to exercise snapshot_f_beta without loading OpenPI."""
+
+    def __init__(self, use_qam: bool = True):
+        super().__init__()
+        # Two small modules so deepcopy + freeze affect more than one tensor.
+        self.paligemma_with_expert = torch.nn.Sequential(
+            torch.nn.Linear(8, 16),
+            torch.nn.Linear(16, 8),
+        )
+        self.config = type("_Cfg", (), {"use_qam": use_qam})()
+        import logging
+
+        self.logger = logging.getLogger("MockExpertHolder")
+
+    # Borrow the methods under test.
+    snapshot_f_beta = OpenPi0ForRLActionPrediction.snapshot_f_beta
+    has_f_beta_snapshot = OpenPi0ForRLActionPrediction.has_f_beta_snapshot
+
+
+def test_snapshot_f_beta_clones_and_freezes_parameters():
+    m = _MockExpertHolder(use_qam=True)
+    assert m.has_f_beta_snapshot is False
+    m.snapshot_f_beta()
+    assert m.has_f_beta_snapshot is True
+
+    f_beta = m._f_beta_paligemma_with_expert
+    # All parameters frozen.
+    assert all(not p.requires_grad for p in f_beta.parameters())
+    # Numerically equal to source at snapshot time.
+    for orig, beta in zip(
+        m.paligemma_with_expert.parameters(), f_beta.parameters()
+    ):
+        assert torch.equal(orig, beta)
+
+
+def test_snapshot_f_beta_is_isolated_from_source():
+    """Mutating the live expert must not change the frozen reference."""
+    m = _MockExpertHolder(use_qam=True)
+    m.snapshot_f_beta()
+    f_beta = m._f_beta_paligemma_with_expert
+
+    with torch.no_grad():
+        next(m.paligemma_with_expert.parameters()).add_(1.0)
+
+    src_param = next(m.paligemma_with_expert.parameters())
+    beta_param = next(f_beta.parameters())
+    assert not torch.equal(src_param, beta_param)
+
+
+def test_snapshot_f_beta_idempotent_raises():
+    m = _MockExpertHolder(use_qam=True)
+    m.snapshot_f_beta()
+    with pytest.raises(RuntimeError, match="already"):
+        m.snapshot_f_beta()
+
+
+def test_snapshot_f_beta_requires_use_qam():
+    m = _MockExpertHolder(use_qam=False)
+    with pytest.raises(RuntimeError, match="use_qam"):
+        m.snapshot_f_beta()

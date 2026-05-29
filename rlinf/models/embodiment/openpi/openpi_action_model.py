@@ -268,6 +268,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             path_parts = name.split(".")
             setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
 
+        # QAM reference policy snapshot
+        self._f_beta_paligemma_with_expert = None
+
     def _obs_processor_for_qam(self, replay_obs):
         """Replay-side equivalent of obs_processor.
 
@@ -1218,6 +1221,58 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     )
 
     # ===== DSRL-specific methods =====
+
+    def snapshot_f_beta(self):
+        """Freeze a deep copy of paligemma_with_expert as the QAM reference policy.
+
+        Plain QAM (LWD §III.C) needs f_β = the pretrained policy, held fixed,
+        so the adjoint loss can be computed on (f_θ - f_β). Without this
+        snapshot taken AFTER the SFT checkpoint load, f_β would be random
+        init and the adjoint signal would be meaningless.
+
+        Implementation: deep-copy the full paligemma_with_expert (VLM + expert)
+        and freeze every parameter. The VLM copy wastes ~6GB at bf16 on pi05
+        but keeps the existing forward path intact — we can revisit and
+        snapshot only the expert layers if memory becomes a bottleneck.
+
+        Must be called:
+          - AFTER the SFT checkpoint has loaded into self.paligemma_with_expert
+            (otherwise f_β is random init).
+          - BEFORE FSDP wraps the model (deepcopy through FlatParameter is
+            unreliable). The QAM actor worker is responsible for the timing.
+        """
+        import copy
+
+        if not getattr(self.config, "use_qam", False):
+            raise RuntimeError(
+                "snapshot_f_beta called but config.use_qam=False — refusing "
+                "to take a snapshot that nothing will consume."
+            )
+        if self.has_f_beta_snapshot:
+            raise RuntimeError(
+                "snapshot_f_beta has already been called for this model; "
+                "f_β is fixed once taken."
+            )
+
+        snapshot = copy.deepcopy(self.paligemma_with_expert)
+        for p in snapshot.parameters():
+            p.requires_grad_(False)
+        snapshot.eval()
+        # add_module is preferred over setattr because PyTorch's
+        # nn.Module.__setattr__ does the same registration when value is a
+        # Module, but add_module makes the intent explicit.
+        self.add_module("_f_beta_paligemma_with_expert", snapshot)
+
+        n_params = sum(p.numel() for p in snapshot.parameters())
+        self.logger.info(
+            f"[QAM] snapshot_f_beta: cloned paligemma_with_expert with "
+            f"{n_params:,} frozen parameters."
+        )
+
+    @property
+    def has_f_beta_snapshot(self) -> bool:
+        """Whether snapshot_f_beta has been called for this model."""
+        return getattr(self, "_f_beta_paligemma_with_expert", None) is not None
 
     def sac_forward(
         self, obs=None, data=None, train=False, return_dist_params=False, **kwargs
