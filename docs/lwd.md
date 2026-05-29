@@ -279,3 +279,38 @@ for w in reversed(grid):
 ```
 
 PyTorch 用 `torch.autograd.functional.vjp` 实现。这是 V1 最难的一步，建议先在 toy `Q(a) = ‖a‖²` 上 sanity 后再上 OpenPI。
+
+---
+
+## 接力区（给下一个对话用）
+
+### 当前快照（2026-05-29）
+
+| 项 | 值 |
+| --- | --- |
+| 分支 | `lwd` |
+| HEAD | `160ea0a fix(lwd): return tokenized prompt dict from _tokenize_language` |
+| 上一步业务提交 | `fca840f refactor(lwd): move QAM f_β handling from model to worker (P3.1 redo)` |
+| 路线进度 | P1 ✅ / P2.1 ✅ / P2.2 ✅ / P3.2 ✅ |
+| 下一步 | **P3.3 adjoint state 反向积分**（最难） |
+
+### 不变量（review 时必须保证不破坏）
+
+1. **f_β 由 worker 持有**，不进 model class（参考 `rlinf/workers/actor/fsdp_sac_policy_worker.py` 的 `target_model` 模式）。
+2. **plain QAM**（关闭 `edit_scale` / `fql_alpha`），不做 DIVL。
+3. **PaliGemma 始终冻结**，YAML `train_expert_only: true` + worker `freeze_vlm()` + `qam_velocity_forward` 入口 assert 三处保险。
+4. **replay obs 契约**：`tokenized_prompt + tokenized_prompt_mask` 走 `_obs_processor_for_qam` 喂给 OpenPI，**不要**再 carry `task_descriptions: list[str]`。
+5. **新加东西配单测**：P2.1/P2.2 在 `tests/models/test_qam_critic_forward.py`（14 个 pass），P1 在 `tests/data/test_append_transitions_language.py`（5 个 pass）。
+
+### P3.3 验收目标
+
+- 在 `rlinf/algorithms/embodiment/` 下新加一个**独立函数** `compute_adjoint_states(f_beta_fn, obs, x1, Q_grad_at_1, num_steps, lambda)`，返回 `xs: [W+1, B, H, A]` 与 `adjs: [W+1, B, H, A]`，**不依赖** worker / FSDP / OpenPI 具体实现。
+- 必须包含 toy sanity 单测：用 `Q(a) = ‖a‖²` + 解析常向量场 `f_β(x, w) = c`，对照解析 adj。
+- 通过后再接 OpenPI 的 `qam_velocity_forward` 当 `f_beta_fn`。
+
+### 协作约定（这位用户的偏好）
+
+- 每个 phase 先**给 patch review**，确认后再 apply；得到 "直接帮我修改代码并提交推送" 才能 commit + push。
+- commit 用 `git commit -s`（DCO 强制），格式 [Conventional Commits](https://www.conventionalcommits.org/)，scope 用 `lwd`。
+- 一个 phase = 一次 commit；commit message 中文 OK，subject < 72 字符。
+- 推完之后给一条"服务器侧验证命令"（通常是一行 `git pull && pytest ...`）。
