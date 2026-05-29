@@ -268,9 +268,6 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             path_parts = name.split(".")
             setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
 
-        # QAM reference policy snapshot
-        self._f_beta_paligemma_with_expert = None
-
     def _obs_processor_for_qam(self, replay_obs):
         """Replay-side equivalent of obs_processor.
 
@@ -475,6 +472,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             return self.sac_q_forward(**kwargs)
         elif forward_type == ForwardType.QAM_Q:
             return self.qam_q_forward(**kwargs)
+        elif forward_type == ForwardType.QAM_VELOCITY:
+            return self.qam_velocity_forward(**kwargs)
         else:
             raise NotImplementedError
 
@@ -1220,59 +1219,89 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                         f"  Froze {noise_net_params:,} parameters in reinflow_explore_noise_net"
                     )
 
-    # ===== DSRL-specific methods =====
+    # ===== QAM-specific methods =====
 
-    def snapshot_f_beta(self):
-        """Freeze a deep copy of paligemma_with_expert as the QAM reference policy.
+    def qam_velocity_forward(
+        self,
+        obs=None,
+        x_t=None,
+        timestep=None,
+        data=None,
+        **kwargs,
+    ):
+        """Single-model velocity forward for QAM:  v_t = f(s, x_t, t).
 
-        Plain QAM (LWD §III.C) needs f_β = the pretrained policy, held fixed,
-        so the adjoint loss can be computed on (f_θ - f_β). Without this
-        snapshot taken AFTER the SFT checkpoint load, f_β would be random
-        init and the adjoint signal would be meaningless.
+        Callers run this on the live (trainable) model to get vf_fine, and
+        independently on a second frozen instance (f_β, held by the QAM
+        actor worker — see EmbodiedQAMFSDPPolicy) to get vf_base. The actor
+        loss `(vf_fine - vf_base)·2/σ + σ·adj` is then assembled outside
+        this method. This matches the SAC target_model pattern already used
+        in fsdp_sac_policy_worker.
 
-        Implementation: deep-copy the full paligemma_with_expert (VLM + expert)
-        and freeze every parameter. The VLM copy wastes ~6GB at bf16 on pi05
-        but keeps the existing forward path intact — we can revisit and
-        snapshot only the expert layers if memory becomes a bottleneck.
+        Plain-QAM contract checked at entry:
+          - use_qam must be True.
+          - PaliGemma must be frozen (caller responsibility: train_expert_only
+            + freeze_vlm at worker setup). We sanity-check and raise on
+            misconfiguration so the prefix-no-grad assumption can't drift
+            silently.
 
-        Must be called:
-          - AFTER the SFT checkpoint has loaded into self.paligemma_with_expert
-            (otherwise f_β is random init).
-          - BEFORE FSDP wraps the model (deepcopy through FlatParameter is
-            unreliable). The QAM actor worker is responsible for the timing.
+        Args:
+            obs:      replay-format dict (main_images, states, tokenized_prompt, mask).
+            x_t:      [B, action_horizon, action_dim] — current point on the flow trajectory.
+            timestep: [B] or [B, 1] — flow time in [0, 1] (normalized to [B] internally).
+        Returns:
+            v_t: [B, action_horizon, action_dim]
         """
-        import copy
-
-        if not getattr(self.config, "use_qam", False):
-            raise RuntimeError(
-                "snapshot_f_beta called but config.use_qam=False — refusing "
-                "to take a snapshot that nothing will consume."
-            )
-        if self.has_f_beta_snapshot:
-            raise RuntimeError(
-                "snapshot_f_beta has already been called for this model; "
-                "f_β is fixed once taken."
-            )
-
-        snapshot = copy.deepcopy(self.paligemma_with_expert)
-        for p in snapshot.parameters():
-            p.requires_grad_(False)
-        snapshot.eval()
-        # add_module is preferred over setattr because PyTorch's
-        # nn.Module.__setattr__ does the same registration when value is a
-        # Module, but add_module makes the intent explicit.
-        self.add_module("_f_beta_paligemma_with_expert", snapshot)
-
-        n_params = sum(p.numel() for p in snapshot.parameters())
-        self.logger.info(
-            f"[QAM] snapshot_f_beta: cloned paligemma_with_expert with "
-            f"{n_params:,} frozen parameters."
+        if not self.config.use_qam:
+            raise RuntimeError("qam_velocity_forward called but use_qam=False")
+        if obs is None:
+            obs = data.get("obs", data) if data is not None else kwargs.get("obs", {})
+        assert x_t is not None and timestep is not None, (
+            "qam_velocity_forward requires x_t and timestep"
         )
 
-    @property
-    def has_f_beta_snapshot(self) -> bool:
-        """Whether snapshot_f_beta has been called for this model."""
-        return getattr(self, "_f_beta_paligemma_with_expert", None) is not None
+        # Sanity check: plain QAM keeps PaliGemma frozen. If anyone toggles
+        # train_expert_only off after setup, the no_grad prefix below silently
+        # breaks the assumption that f_θ and f_β see identical VLM state.
+        first_vlm_param = next(self.paligemma_with_expert.paligemma.parameters())
+        if first_vlm_param.requires_grad:
+            raise RuntimeError(
+                "qam_velocity_forward requires PaliGemma to be frozen "
+                "(plain QAM contract). Set actor.model.train_expert_only=True "
+                "and ensure worker calls freeze_vlm() at setup."
+            )
+
+        # Obs pipeline mirroring qam_q_forward.
+        to_process_obs = self._obs_processor_for_qam(obs)
+        processed_obs = self.input_transform(to_process_obs, transpose=False)
+        processed_obs = self.precision_processor(processed_obs)
+        observation = _model.Observation.from_dict(processed_obs)
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+
+        # Device/dtype/shape normalization on flow inputs.
+        x_t = x_t.to(device=state.device, dtype=state.dtype)
+        if timestep.dim() == 2 and timestep.shape[-1] == 1:
+            timestep = timestep.squeeze(-1)
+        timestep = timestep.to(device=state.device, dtype=state.dtype)
+
+        # VLM frozen → no grad needs to reach PaliGemma.
+        with torch.no_grad():
+            _, prefix_pad_masks, past_key_values = self._build_prefix_cache(
+                images, img_masks, lang_tokens, lang_masks
+            )
+
+        # Action expert + projections — gradient flows here on the live model
+        # (trainable expert + projections). On the f_β model instance all
+        # params are requires_grad=False, so the gradient still won't
+        # accumulate even without an explicit no_grad context.
+        v_t, _ = self.get_velocity(
+            state, x_t, timestep, prefix_pad_masks, past_key_values
+        )
+        return v_t
+
+    # ===== DSRL-specific methods =====
 
     def sac_forward(
         self, obs=None, data=None, train=False, return_dist_params=False, **kwargs

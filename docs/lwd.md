@@ -11,13 +11,14 @@ P2  critic 前向 (Q_φ)
     P2.2 ✅ 单元测试
     P2.4 ⏳ TD loss + target critic + critic optimizer（worker 侧）
 P3  actor 训练
-    P3.1 ✅ 冻结 f_β 快照
-    P3.2 ⏳ qam_velocity_forward（同时算 f_θ 和 f_β 的 velocity）
+    P3.2 ✅ qam_velocity_forward（单模型 velocity；worker 持有两份模型实例）
     P3.3 ⏳ adjoint state 反向积分（最难）
     P3.4 ⏳ QAM actor loss
-    P3.5 ⏳ EmbodiedQAMFSDPPolicy worker
+    P3.5 ⏳ EmbodiedQAMFSDPPolicy worker（同 SAC target_model 模式）
 P5  ⏳ YAML + smoke + LIBERO eval
 ```
+
+> P3.1（冻结 f_β 快照）的初版尝试**已撤回**。理由：f_β 应由 worker 持有、独立 FSDP wrap，沿用现有 SAC `target_model` pattern，而不是塞进 model class 里。详见下方 P3.2 章节。
 
 LWD 论文公式 (9) —— V1 实现按此对齐：
 
@@ -176,69 +177,105 @@ pytest tests/models/test_qam_critic_forward.py -v
 
 ---
 
-## P3.1：冻结 `f_β` 快照
+## P3.2：单模型 velocity 前向（`qam_velocity_forward`）
 
-### P3.1 问题
+### P3.2 问题
 
-QAM actor 的损失里有 `f_δ = f_θ - f_β`。其中：
+QAM actor loss 需要 `f_δ = f_θ - f_β`：
 
-- `f_θ` = **可训练的** action expert（就是现有 `paligemma_with_expert.gemma_expert`，继续 in-place 训）
-- `f_β` = **冻结的** reference action expert（SFT checkpoint 加载完后**克隆一份**，全程 `requires_grad=False`）
+- `f_θ` = **可训练的** action expert（live model 的 `paligemma_with_expert.gemma_expert` + 6 个 projection）
+- `f_β` = **冻结的** reference action expert（SFT 加载后保持不变）
 
-没有 `f_β` 的话 P3.2 的 `qam_velocity_forward` 无法同时算出 `(vf_fine, vf_base)`，整个 adjoint loss 无源头。
+**初版尝试（P3.1）走错了层级**：在 `OpenPi0ForRLActionPrediction` 里加 `snapshot_f_beta()` 用 `add_module` 把 f_β 注册成 child module，再用 `_swap_to_fbeta` context manager 临时改 `self._modules`。Review 发现 3 个 FSDP 阻塞风险：
 
-### P3.1 文件改动
+1. `add_module` 让 f_β 进入 `state_dict` / FSDP wrap / weight_syncer 作用域
+2. `_swap_to_fbeta` 在 FSDP 下原地改 module tree 不稳定
+3. live prefix 与 f_β 共享，依赖"VLM 永远冻结"这个隐式不变量
+
+### P3.2 决策：照搬 SAC `target_model` pattern
+
+RLinf 已有成熟的"frozen peer model"模式 —— [fsdp_sac_policy_worker.py:78-110](../rlinf/workers/actor/fsdp_sac_policy_worker.py#L78-L110)：
+
+```python
+module = self.model_provider_func()
+target_module = self.model_provider_func()            # 第二个独立实例
+self.model = self._strategy.wrap_model(module, ...)
+self.target_model = self._strategy.wrap_model(         # 独立 FSDP wrap
+    target_module, device_mesh=self._device_mesh
+)
+self.target_model.requires_grad_(False)
+```
+
+特点：
+
+- `target_model` 由 **worker 持有**，不嵌入 model class
+- **各自独立 FSDP wrap**，FSDP 不困惑
+- 有独立 ckpt / soft-update 路径，已经验证多卡
+- 多卡 device/dtype/sync 都走 FSDP 自己的管理
+
+把这个模式套到 QAM `f_β` 上，3 个 review 风险**全部消失**。
+
+### P3.2 文件改动
 
 | 文件 | 改动 |
 | --- | --- |
-| `rlinf/models/embodiment/openpi/openpi_action_model.py` | `__init__` 末尾加 `self._f_beta_paligemma_with_expert = None` 占位 |
-| `rlinf/models/embodiment/openpi/openpi_action_model.py` | 新增 `snapshot_f_beta()` 方法 + `has_f_beta_snapshot` property |
-| `tests/models/test_qam_critic_forward.py` | 加 `_MockExpertHolder` + 4 个单测 |
+| `rlinf/models/embodiment/openpi/openpi_action_model.py` | **删除** P3.1 的 `snapshot_f_beta` / `has_f_beta_snapshot` / `_swap_to_fbeta` / `_f_beta_*` 占位（及 `contextlib` import） |
+| `rlinf/models/embodiment/openpi/openpi_action_model.py` | 新增 `qam_velocity_forward(obs, x_t, timestep)` — 单模型 velocity，返回 `[B, H, A]` |
+| `rlinf/models/embodiment/openpi/openpi_action_model.py` | `forward()` dispatch 加 `ForwardType.QAM_VELOCITY` 分支（之前已加） |
+| `tests/models/test_qam_critic_forward.py` | 删 4 个 snapshot/swap 单测；P2.2 critic 单测保留 |
 
-### P3.1 实现细节
-
-`snapshot_f_beta()` 的核心动作：
+### `qam_velocity_forward` 流水线（与 `qam_q_forward` 同样的 obs 处理）
 
 ```text
-copy.deepcopy(self.paligemma_with_expert)
-  → 所有参数 requires_grad_(False)
-  → .eval()
-  → self.add_module("_f_beta_paligemma_with_expert", snapshot)
+obs (replay dict) + x_t [B, H, A] + timestep [B]
+    │
+    ▼  ① _obs_processor_for_qam
+    ▼  ② input_transform           (image resize/normalize)
+    ▼  ③ precision_processor
+    ▼  ④ _model.Observation.from_dict
+    ▼  ⑤ _preprocess_observation → (images, masks, lang_tokens, lang_masks, state)
+    ▼  ⑥ device/dtype 校正 x_t / timestep
+    ▼  ⑦ with no_grad: _build_prefix_cache → prefix_pad_masks, past_key_values
+    ▼  ⑧ get_velocity(state, x_t, t, prefix_pad_masks, past_key_values) → v_t
+
+v_t [B, H, A]   ← 返回
 ```
 
-**为什么 deepcopy 整个 `paligemma_with_expert` 而不是只克隆 `gemma_expert`**：
-克隆整个对象（含 VLM 引用）保证 forward 路径与原版完全一致，工程上最简单。代价是 VLM 多占 ~6GB bf16（pi05 上），H200 80GB 显存够。如果将来要省内存，可以只克隆 expert 部分 + 周边小投影模块（`action_in_proj` 等 6 个），但 V1 不做。
+⚠️ 入口 **assert PaliGemma frozen** —— 防止配置漂移让两个 model 实例的 VLM 不一致。
 
-### P3.1 设计决策
+### P3.2 设计决策
 
-- **调用时机**：必须在 **SFT checkpoint 加载完之后** 且 **FSDP wrap 之前**。worker 侧（P3.5）的 `setup_model_and_optimizer` 负责。
-- **`add_module` 注册**：让 PyTorch 把它当 child module，`.to(device)` / `.eval()` / state_dict 自动包含。代价是 ckpt 文件多 ~6GB；V1 接受这个代价。
-- **idempotent 校验**：第二次调用 raise，防止误用导致 `f_β` 被覆盖。
-- **`has_f_beta_snapshot` property**：P3.2 forward 之前 assert 这个为 True，给出清晰错误。
+- **不在 model class 持有 f_β**。worker 持有两个独立 model 实例（live + f_β），各自走完整 FSDP wrap。
+- **f_β model 与 live model 共用 `model_provider_func` + 同一 SFT checkpoint**，加载完后整个 `requires_grad_(False)` + `eval()`。
+- **VLM 各自跑 prefix**，不复用 live KV cache。两边 VLM 都已冻结、权重一致，结果数值上等价；省下的 "prefix 复用"优化放 V2。
+- **device/dtype/shape 显式处理**：`qam_velocity_forward` 入口把 `x_t`、`timestep` 校正到 `state.device/dtype`，`timestep` 统一成 `[B]`。
+- **VLM 冻结由两侧保证**：YAML `train_expert_only: true` + worker 显式 `freeze_vlm()`；`qam_velocity_forward` 入口再 assert 一次。
 
-### P3.1 还没做的事
+### P3.2 还没做的事
 
-- ❌ 调用 `snapshot_f_beta()` —— P3.5 worker 侧。
-- ❌ 用 `f_β` 算 velocity —— P3.2 `qam_velocity_forward`。
-- ❌ 显存优化（只克隆 expert）—— V2。
-- ❌ 排除 `_f_beta_*` 出 state_dict —— V2。
+- ❌ Worker 侧建第二份 f_β 实例 —— P3.5。
+- ❌ Adjoint state 反向积分 —— P3.3。
+- ❌ Actor loss 组装 `(vf_fine - vf_base)·2/σ + σ·adj` —— P3.4。
+- ❌ 端到端 GPU smoke —— P5。
 
-### P3.1 验证
+### P3.2 验证
 
 ```bash
-pytest tests/models/test_qam_critic_forward.py -v -k snapshot
+pytest tests/models/test_qam_critic_forward.py -v
 ```
+
+P2.1 + P2.2 的 14 个 critic 单测继续 pass。`qam_velocity_forward` 本身的 GPU 端到端验证在 P5 smoke 里。
 
 ---
 
-## 下一步：P3.2 `qam_velocity_forward`
+## 下一步：P3.3 adjoint state 反向积分
 
-给定 `(obs, x_t, t)`，分别用 `f_θ`（trainable）和 `f_β`（frozen snapshot）算两个 velocity：
+QAM 官方代码 [`adj_matching`](https://github.com/ColinQiyangLi/qam/blob/main/agents/qam.py#L50)：从 noise 出发跑 flow 前向积分得到 `xs`、再从终端 `∇_a Q` 出发**反向 vjp** 积分得到每步 adj，最终为 P3.4 的 loss 提供 `g̃_w` 序列。
 
 ```python
-vf_fine = paligemma_with_expert.expert(prefix_kv, x_t, t)        # f_θ, gradient on
-vf_base = _f_beta_paligemma_with_expert.expert(prefix_kv, x_t, t) # f_β, frozen
-return vf_fine, vf_base
+g̃_1 = -∇_a [Q_φ(z_t, a¹) / λ]
+for w in reversed(grid):
+    g̃_w = g̃_{w+h} + h · vjp(f_β at (s, x_w, w+h), g̃_{w+h})
 ```
 
-这是 P3.3 adjoint matching loss `‖(vf_fine - vf_base) * 2/σ + σ * adj‖²` 的左半部分。
+PyTorch 用 `torch.autograd.functional.vjp` 实现。这是 V1 最难的一步，建议先在 toy `Q(a) = ‖a‖²` 上 sanity 后再上 OpenPI。
