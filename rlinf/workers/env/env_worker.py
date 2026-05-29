@@ -225,6 +225,8 @@ class EnvWorker(Worker):
                 np.stack(masks_list, axis=0)
             ).to(dtype=torch.bool),
         }
+        return result
+        
 
     def update_env_cfg(self):
         if not self.only_eval:
