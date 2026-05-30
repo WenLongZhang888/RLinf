@@ -14,7 +14,14 @@
 
 from rlinf.algorithms.embodiment.qam import (
     compute_adjoint_states,
+    compute_qam_actor_objective,
     compute_qam_actor_loss,
+    sample_forward_sde,
 )
 
-__all__ = ["compute_adjoint_states", "compute_qam_actor_loss"]
+__all__ = [
+    "compute_adjoint_states",
+    "compute_qam_actor_loss",
+    "compute_qam_actor_objective",
+    "sample_forward_sde",
+]

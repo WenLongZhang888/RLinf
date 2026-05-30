@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Callable
+import math
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
@@ -29,6 +30,247 @@ def _validate_same_shape(
             f"{name} and {reference_name} must have the same shape, got "
             f"{tuple(tensor.shape)} and {tuple(reference.shape)}"
         )
+
+
+def _validate_velocity_output(
+    name: str,
+    velocity: torch.Tensor,
+    x_t: torch.Tensor,
+) -> torch.Tensor:
+    if velocity.shape != x_t.shape:
+        raise ValueError(
+            f"{name} must return the same shape as its x_t input, got "
+            f"{tuple(velocity.shape)} and expected {tuple(x_t.shape)}"
+        )
+    if not velocity.is_floating_point():
+        raise TypeError(
+            f"{name} must return a floating point tensor, got {velocity.dtype}"
+        )
+    return velocity.to(device=x_t.device, dtype=x_t.dtype)
+
+
+def _as_action_shape(action_shape: Sequence[int] | torch.Size) -> tuple[int, ...]:
+    try:
+        shape = tuple(int(dim) for dim in action_shape)
+    except TypeError as exc:
+        raise TypeError("action_shape must be a sequence of positive integers") from exc
+    if len(shape) < 2:
+        raise ValueError(
+            "action_shape must include batch and at least one action dimension, "
+            f"got {shape}"
+        )
+    if any(dim <= 0 for dim in shape):
+        raise ValueError(f"action_shape dimensions must be positive, got {shape}")
+    return shape
+
+
+def _find_first_tensor(payload: Any) -> torch.Tensor | None:
+    if isinstance(payload, torch.Tensor):
+        return payload
+    if isinstance(payload, dict):
+        for value in payload.values():
+            tensor = _find_first_tensor(value)
+            if tensor is not None:
+                return tensor
+    elif isinstance(payload, (list, tuple)):
+        for value in payload:
+            tensor = _find_first_tensor(value)
+            if tensor is not None:
+                return tensor
+    return None
+
+
+def _infer_device_dtype(payload: Any) -> tuple[torch.device, torch.dtype]:
+    tensor = _find_first_tensor(payload)
+    if tensor is None:
+        return torch.device("cpu"), torch.float32
+    dtype = tensor.dtype if tensor.is_floating_point() else torch.float32
+    return tensor.device, dtype
+
+
+def _time_batch(
+    batch_size: int,
+    value: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch.full((batch_size,), value, device=device, dtype=dtype)
+
+
+def sample_forward_sde(
+    f_theta_fn: Callable[[Any, torch.Tensor, torch.Tensor], torch.Tensor],
+    f_beta_fn: Callable[[Any, torch.Tensor, torch.Tensor], torch.Tensor],
+    obs: Any,
+    action_shape: Sequence[int] | torch.Size,
+    num_steps: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Sample a fixed QAM forward SDE trajectory.
+
+    The returned trajectory is ordered by increasing flow time and has shape
+    ``[num_steps + 1, B, *action_dims]``. Following the official QAM sampler,
+    velocity fields are evaluated on the unshifted grid ``t = i / W`` while the
+    diffusion and singular drift denominator use the h-shift ``t + h``.
+
+    Args:
+        f_theta_fn: Trainable velocity closure with signature
+            ``(obs, x_t, timestep) -> velocity``.
+        f_beta_fn: Frozen behavior velocity closure used for the final pure
+            ODE Euler step.
+        obs: Observation payload passed through to both velocity closures.
+        action_shape: Full batched action shape ``[B, *action_dims]``.
+        num_steps: Number of flow steps ``W``.
+        generator: Optional random generator for reproducible noise.
+
+    Returns:
+        Sampled trajectory ``xs`` with shape ``[W + 1, B, *action_dims]``.
+    """
+    if num_steps <= 0:
+        raise ValueError(f"num_steps must be positive, got {num_steps}")
+
+    shape = _as_action_shape(action_shape)
+    batch_size = shape[0]
+    device, dtype = _infer_device_dtype(obs)
+    h = 1.0 / num_steps
+    sqrt_h = math.sqrt(h)
+
+    with torch.no_grad():
+        x_t = torch.randn(shape, device=device, dtype=dtype, generator=generator)
+        xs = [x_t.clone()]
+
+        for step in range(num_steps - 1):
+            t_value = step / num_steps
+            timestep = _time_batch(batch_size, t_value, device, dtype)
+            velocity = _validate_velocity_output(
+                "f_theta_fn",
+                f_theta_fn(obs, x_t, timestep),
+                x_t,
+            )
+            sigma = math.sqrt(2.0 * (1.0 - t_value + h) / (t_value + h))
+            noise = torch.randn(shape, device=device, dtype=dtype, generator=generator)
+            drift = 2.0 * velocity - x_t / (t_value + h)
+            x_t = x_t + h * drift + sqrt_h * sigma * noise
+            xs.append(x_t.clone())
+
+        timestep = _time_batch(batch_size, (num_steps - 1) / num_steps, device, dtype)
+        beta_velocity = _validate_velocity_output(
+            "f_beta_fn",
+            f_beta_fn(obs, x_t, timestep),
+            x_t,
+        )
+        x_t = x_t + h * beta_velocity
+        xs.append(x_t.clone())
+
+    return torch.stack(xs, dim=0)
+
+
+def compute_qam_actor_objective(
+    f_theta_fn: Callable[[Any, torch.Tensor, torch.Tensor], torch.Tensor],
+    f_beta_fn: Callable[[Any, torch.Tensor, torch.Tensor], torch.Tensor],
+    q_grad_fn: Callable[[torch.Tensor], torch.Tensor],
+    obs: Any,
+    action_shape: Sequence[int] | torch.Size,
+    num_steps: int,
+    inv_temp: float | torch.Tensor,
+    loss_mask: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute the plain QAM actor objective with closure-provided components.
+
+    This orchestrates trajectory sampling, target-critic terminal seeding,
+    adjoint propagation, and step-wise adjoint matching while remaining
+    independent of workers, FSDP, and OpenPI-specific state.
+
+    Gradients flow through ``f_theta_fn`` only when velocities are re-evaluated
+    on the fixed sampled trajectory. Sampling, the frozen behavior velocity,
+    and propagated adjoints are detached from the actor update.
+
+    Args:
+        f_theta_fn: Trainable actor velocity closure.
+        f_beta_fn: Frozen behavior velocity closure.
+        q_grad_fn: Closure returning the raw terminal critic action gradient at
+            ``xs[-1]`` with the same shape as the action trajectory state.
+        obs: Observation payload passed through to velocity closures.
+        action_shape: Full batched action shape ``[B, *action_dims]``.
+        num_steps: Number of flow steps ``W``.
+        inv_temp: QAM inverse temperature ``tau``. The adjoint helper receives
+            ``lambda_ = 1 / inv_temp``.
+        loss_mask: Optional mask forwarded to :func:`compute_qam_actor_loss`.
+        generator: Optional random generator for reproducible trajectory
+            sampling.
+
+    Returns:
+        ``(loss, metrics)`` from :func:`compute_qam_actor_loss`.
+    """
+    xs = sample_forward_sde(
+        f_theta_fn=f_theta_fn,
+        f_beta_fn=f_beta_fn,
+        obs=obs,
+        action_shape=action_shape,
+        num_steps=num_steps,
+        generator=generator,
+    )
+
+    inv_temp_t = torch.as_tensor(inv_temp, device=xs.device, dtype=xs.dtype)
+    if bool(torch.any(inv_temp_t == 0).item()):
+        raise ValueError("inv_temp must be non-zero")
+
+    q_grad_at_1 = q_grad_fn(xs[-1])
+    _validate_same_shape("q_grad_fn output", q_grad_at_1, "xs[-1]", xs[-1])
+    if not q_grad_at_1.is_floating_point():
+        raise TypeError(
+            "q_grad_fn must return a floating point tensor, "
+            f"got {q_grad_at_1.dtype}"
+        )
+
+    _, adjs = compute_adjoint_states(
+        f_beta_fn=f_beta_fn,
+        obs=obs,
+        xs=xs,
+        Q_grad_at_1=q_grad_at_1,
+        lambda_=1.0 / inv_temp_t,
+    )
+
+    batch_size = xs.shape[1]
+    vf_fine: list[torch.Tensor] = []
+    vf_base: list[torch.Tensor] = []
+    for step in range(num_steps):
+        x_t = xs[step].detach()
+        timestep = _time_batch(
+            batch_size,
+            step / num_steps,
+            x_t.device,
+            x_t.dtype,
+        )
+        vf_fine.append(
+            _validate_velocity_output(
+                "f_theta_fn",
+                f_theta_fn(obs, x_t, timestep),
+                x_t,
+            )
+        )
+        with torch.no_grad():
+            vf_base.append(
+                _validate_velocity_output(
+                    "f_beta_fn",
+                    f_beta_fn(obs, x_t, timestep),
+                    x_t,
+                )
+            )
+
+    # ``compute_qam_actor_loss`` uses the full ``[W + 1, B, ...]`` shape to
+    # infer ``h = 1 / W``, then drops the terminal row when ``skip_terminal`` is
+    # true. Padding avoids an unnecessary actor call at t=1.
+    vf_fine.append(torch.zeros_like(xs[-1]))
+    vf_base.append(torch.zeros_like(xs[-1]))
+
+    return compute_qam_actor_loss(
+        vf_fine=torch.stack(vf_fine, dim=0),
+        vf_base=torch.stack(vf_base, dim=0),
+        adjs=adjs,
+        loss_mask=loss_mask,
+        skip_terminal=True,
+    )
 
 
 def compute_adjoint_states(
