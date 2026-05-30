@@ -210,3 +210,23 @@ def test_pool_prefix_unknown_config_name_raises():
     prefix = torch.randn(2, 968, 2048)
     with pytest.raises(ValueError, match="config_name"):
         OpenPi0ForRLActionPrediction._pool_prefix_for_qam(mock, prefix)
+
+
+# ============ QAM ↔ OpenPI flow-time / velocity convention ============
+
+
+def test_qam_to_openpi_flow_time_is_mirror():
+    """QAM w↔OpenPI t mirror: t = 1 - w. Pinned because the velocity field
+    is trained in OpenPI's convention but called from QAM coordinates."""
+    w = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0])
+    t = OpenPi0ForRLActionPrediction._qam_to_openpi_flow_time(w)
+    assert torch.allclose(t, torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]))
+
+
+def test_qam_to_openpi_flow_time_preserves_dtype_and_shape():
+    """Mirror must be dtype/shape-transparent so callers don't need to recast."""
+    for dtype in (torch.float32, torch.bfloat16, torch.float64):
+        w = torch.tensor([0.1, 0.9], dtype=dtype)
+        t = OpenPi0ForRLActionPrediction._qam_to_openpi_flow_time(w)
+        assert t.dtype == dtype
+        assert t.shape == w.shape

@@ -1221,6 +1221,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     # ===== QAM-specific methods =====
 
+    @staticmethod
+    def _qam_to_openpi_flow_time(timestep_qam: torch.Tensor) -> torch.Tensor:
+        """Mirror QAM flow time (w=0 noise, w=1 data) to OpenPI flow time
+        (t=1 noise, t=0 data). Used by qam_velocity_forward and any other
+        caller that needs OpenPI's get_velocity from a QAM-coordinate timestep.
+        """
+        return 1.0 - timestep_qam
+
     def qam_velocity_forward(
         self,
         obs=None,
@@ -1248,7 +1256,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         Args:
             obs:      replay-format dict (main_images, states, tokenized_prompt, mask).
             x_t:      [B, action_horizon, action_dim] — current point on the flow trajectory.
-            timestep: [B] or [B, 1] — flow time in [0, 1] (normalized to [B] internally).
+            timestep: [B] or [B, 1] — QAM flow time w ∈ [0, 1] (w=0 noise,
+                      w=1 data). Internally mirrored to OpenPI t = 1 - w
+                      before get_velocity; the returned v_t is in QAM
+                      convention (negated relative to OpenPI's v).
         Returns:
             v_t: [B, action_horizon, action_dim]
         """
@@ -1286,6 +1297,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             timestep = timestep.squeeze(-1)
         timestep = timestep.to(device=state.device, dtype=state.dtype)
 
+        # QAM ↔ OpenPI flow-time mirroring. QAM (LWD §III.C) uses w∈[0,1]
+        # with w=0 at noise and w=1 at data; OpenPI uses t∈[0,1] with t=0
+        # at data and t=1 at noise. These are mirrored (t = 1 - w), and the
+        # velocity fields differ by sign: v_QAM = dx/dw = -dx/dt = -v_OpenPI.
+        # This wrapper is the only place that knows about OpenPI; callers in
+        # rlinf.algorithms.embodiment.qam stay in QAM coordinates.
+        timestep_openpi = self._qam_to_openpi_flow_time(timestep)
+
         # VLM frozen → no grad needs to reach PaliGemma.
         with torch.no_grad():
             _, prefix_pad_masks, past_key_values = self._build_prefix_cache(
@@ -1296,10 +1315,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # (trainable expert + projections). On the f_β model instance all
         # params are requires_grad=False, so the gradient still won't
         # accumulate even without an explicit no_grad context.
-        v_t, _ = self.get_velocity(
-            state, x_t, timestep, prefix_pad_masks, past_key_values
+        v_openpi, _ = self.get_velocity(
+            state, x_t, timestep_openpi, prefix_pad_masks, past_key_values
         )
-        return v_t
+        # v_OpenPI is dx/dt; QAM expects v_QAM = dx/dw = -v_OpenPI.
+        return -v_openpi
 
     # ===== DSRL-specific methods =====
 

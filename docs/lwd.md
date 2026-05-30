@@ -255,6 +255,7 @@ v_t [B, H, A]   ← 返回
 - **VLM 各自跑 prefix**，不复用 live KV cache。两边 VLM 都已冻结、权重一致，结果数值上等价；省下的 "prefix 复用"优化放 V2。
 - **device/dtype/shape 显式处理**：`qam_velocity_forward` 入口把 `x_t`、`timestep` 校正到 `state.device/dtype`，`timestep` 统一成 `[B]`。
 - **VLM 冻结由两侧保证**：YAML `train_expert_only: true` + worker 显式 `freeze_vlm()`；`qam_velocity_forward` 入口再 assert 一次。
+- **QAM ↔ OpenPI flow-time 镜像**：QAM (LWD §III.C) 约定 `w=0` 噪声、`w=1` 数据；OpenPI 内部 (`_get_timesteps` 单调递减) 约定 `t=0` 数据、`t=1` 噪声。两者镜像 `t = 1 - w`，且 velocity 方向相反（`v_QAM = dx/dw = -v_OpenPI`）。这个转换**仅**封装在 `qam_velocity_forward` 内（唯一了解 OpenPI 的入口）；上层 `rlinf.algorithms.embodiment.qam` 全部保持 QAM 坐标。`_qam_to_openpi_flow_time` 是 staticmethod，单测钉死。
 
 ### P3.2 还没做的事
 
