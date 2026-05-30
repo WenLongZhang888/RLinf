@@ -18,6 +18,19 @@ from typing import Any
 import torch
 
 
+def _validate_same_shape(
+    name: str,
+    tensor: torch.Tensor,
+    reference_name: str,
+    reference: torch.Tensor,
+) -> None:
+    if tensor.shape != reference.shape:
+        raise ValueError(
+            f"{name} and {reference_name} must have the same shape, got "
+            f"{tuple(tensor.shape)} and {tuple(reference.shape)}"
+        )
+
+
 def compute_adjoint_states(
     f_beta_fn: Callable[[Any, torch.Tensor, torch.Tensor], torch.Tensor],
     obs: Any,
@@ -125,3 +138,204 @@ def compute_adjoint_states(
         adjs[step - 1] = (adj_next + h * vjp_x).detach()
 
     return traj, torch.stack(adjs, dim=0)
+
+
+def compute_qam_actor_loss(
+    vf_fine: torch.Tensor,
+    vf_base: torch.Tensor,
+    adjs: torch.Tensor,
+    loss_mask: torch.Tensor | None = None,
+    skip_terminal: bool = True,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute the plain QAM actor loss on a fixed trajectory.
+
+    This helper implements the step-wise adjoint matching objective
+
+    ``|| 2 * (f_theta - f_beta) / sigma_t + sigma_t * adj_t ||^2``
+
+    using velocities already evaluated on the same actor trajectory. It is a
+    pure tensor helper: callers are responsible for producing ``vf_fine`` from
+    the trainable actor, ``vf_base`` from frozen ``f_beta``, and ``adjs`` from
+    :func:`compute_adjoint_states`.
+
+    The noise schedule ``sigma_t`` is the diffusion coefficient of the QAM
+    forward SDE (``da = (2 f - a / t) dt + sigma_t dB``), evaluated with the
+    h-shift used by the official QAM code so it stays finite at both ends::
+
+        sigma_t = sqrt(2 * (1 - t + h) / (t + h)),   h = 1 / W.
+
+    This must match the drift ``2 f_beta - a / t`` that
+    :func:`compute_adjoint_states` integrates; using ``sqrt(2 (1 - t))`` here
+    would be inconsistent with that adjoint.
+
+    The reduction matches official QAM: the squared residual is summed over the
+    action dimensions and the flow-time dimension, then averaged over the batch
+    (over the valid batch entries when ``loss_mask`` is given).
+
+    Args:
+        vf_fine: Trainable actor velocities, shape ``[W+1, B, ...]``.
+        vf_base: Frozen behavior velocities, same shape as ``vf_fine``.
+        adjs: Lean adjoint states, same shape as ``vf_fine``.
+        loss_mask: Optional per-(time, batch) validity mask. Supported shapes
+            are ``[W+1]`` / ``[W]`` (time), ``[B]`` (batch), or the 2-D
+            ``[W+1, B]`` / ``[W, B]`` forms.
+        skip_terminal: Whether to drop ``t=1`` from the objective. This should
+            normally stay ``True`` for parity with official QAM, which only
+            uses the positions ``0..W-1``.
+
+    Returns:
+        A pair ``(loss, metrics)``. Gradients flow only through ``vf_fine``.
+    """
+    if vf_fine.ndim < 2:
+        raise ValueError(
+            f"vf_fine must have shape [W+1, B, ...], got {tuple(vf_fine.shape)}"
+        )
+    _validate_same_shape("vf_base", vf_base, "vf_fine", vf_fine)
+    _validate_same_shape("adjs", adjs, "vf_fine", vf_fine)
+    if not vf_fine.is_floating_point():
+        raise TypeError(f"vf_fine must be a floating point tensor, got {vf_fine.dtype}")
+    if not vf_base.is_floating_point():
+        raise TypeError(f"vf_base must be a floating point tensor, got {vf_base.dtype}")
+    if not adjs.is_floating_point():
+        raise TypeError(f"adjs must be a floating point tensor, got {adjs.dtype}")
+
+    num_steps = vf_fine.shape[0] - 1
+    if num_steps <= 0:
+        raise ValueError(
+            f"vf_fine must contain at least two time states, got {vf_fine.shape[0]}"
+        )
+
+    calc_dtype = (
+        torch.float32
+        if vf_fine.dtype in (torch.float16, torch.bfloat16)
+        else vf_fine.dtype
+    )
+    fine = vf_fine.to(dtype=calc_dtype)
+    base = vf_base.detach().to(device=vf_fine.device, dtype=calc_dtype)
+    adj = adjs.detach().to(device=vf_fine.device, dtype=calc_dtype)
+
+    h = 1.0 / num_steps
+    times = torch.linspace(
+        0.0,
+        1.0,
+        num_steps + 1,
+        device=vf_fine.device,
+        dtype=calc_dtype,
+    )
+    if skip_terminal:
+        fine = fine[:-1]
+        base = base[:-1]
+        adj = adj[:-1]
+        times = times[:-1]
+
+    # h-shifted QAM diffusion coefficient: finite at t=0 and t=1.
+    sigma = torch.sqrt(2.0 * (1.0 - times + h) / (times + h))
+    sigma = sigma.view(-1, *([1] * (fine.ndim - 1)))
+
+    velocity_delta = fine - base
+    residual = velocity_delta * (2.0 / sigma) + sigma * adj
+    squared_residual = residual.square()
+
+    # Official QAM reduction: sum over action dims and flow-time, mean over the
+    # (valid) batch. ``squared_residual`` is [W_sel, B, *action_dims].
+    selected_steps, batch_size = squared_residual.shape[:2]
+    action_dims = tuple(range(2, squared_residual.ndim))
+    per_step_sample = (
+        squared_residual.sum(dim=action_dims) if action_dims else squared_residual
+    )  # [W_sel, B]
+
+    mask = _prepare_qam_loss_mask(
+        loss_mask=loss_mask,
+        selected_steps=selected_steps,
+        batch_size=batch_size,
+        full_num_steps=num_steps + 1,
+        skip_terminal=skip_terminal,
+        device=squared_residual.device,
+        dtype=calc_dtype,
+    )
+    if mask is None:
+        per_sample = per_step_sample.sum(dim=0)  # [B]
+        loss = per_sample.mean()
+        denominator = torch.tensor(
+            float(batch_size), device=squared_residual.device, dtype=calc_dtype
+        )
+    else:
+        per_sample = (per_step_sample * mask).sum(dim=0)  # [B]
+        denominator = (mask.sum(dim=0) > 0).sum().clamp_min(1).to(calc_dtype)
+        loss = per_sample.sum() / denominator
+
+    full_mask = None
+    if mask is not None:
+        full_mask = mask.view(
+            selected_steps, batch_size, *([1] * len(action_dims))
+        ).broadcast_to(squared_residual.shape)
+
+    with torch.no_grad():
+        residual_abs = _masked_mean_for_qam(residual.detach().abs(), full_mask)
+        delta_abs = _masked_mean_for_qam(velocity_delta.detach().abs(), full_mask)
+        adj_abs = _masked_mean_for_qam(adj.detach().abs(), full_mask)
+        metrics = {
+            "actor/qam_loss": loss.detach(),
+            "actor/qam_residual_abs": residual_abs,
+            "actor/qam_velocity_delta_abs": delta_abs,
+            "actor/qam_adj_abs": adj_abs,
+            "actor/qam_sigma_min": sigma.detach().min(),
+            "actor/qam_sigma_max": sigma.detach().max(),
+            "actor/qam_valid_count": denominator.detach(),
+        }
+
+    return loss, metrics
+
+
+def _prepare_qam_loss_mask(
+    loss_mask: torch.Tensor | None,
+    selected_steps: int,
+    batch_size: int,
+    full_num_steps: int,
+    skip_terminal: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """Normalize ``loss_mask`` to a ``[W_sel, B]`` float mask (or ``None``)."""
+    if loss_mask is None:
+        return None
+
+    mask = loss_mask.to(device=device, dtype=dtype)
+
+    if mask.ndim == 1:
+        if mask.shape[0] == batch_size:
+            mask = mask.view(1, batch_size).expand(selected_steps, batch_size)
+        elif mask.shape[0] == full_num_steps:
+            mask = mask[:-1] if skip_terminal else mask
+            mask = mask.view(selected_steps, 1).expand(selected_steps, batch_size)
+        elif mask.shape[0] == selected_steps:
+            mask = mask.view(selected_steps, 1).expand(selected_steps, batch_size)
+        else:
+            raise ValueError(
+                "loss_mask must have leading dimension W+1, selected W, or batch "
+                f"B; got shape {tuple(loss_mask.shape)} for [W={selected_steps}, "
+                f"B={batch_size}]"
+            )
+    elif mask.ndim == 2:
+        if mask.shape[0] == full_num_steps:
+            mask = mask[:-1] if skip_terminal else mask
+        if mask.shape != (selected_steps, batch_size):
+            raise ValueError(
+                "loss_mask must be broadcastable to [W, B] = "
+                f"[{selected_steps}, {batch_size}]; got {tuple(loss_mask.shape)}"
+            )
+    else:
+        raise ValueError(
+            f"loss_mask must be 1-D or 2-D, got shape {tuple(loss_mask.shape)}"
+        )
+
+    return mask.contiguous()
+
+
+def _masked_mean_for_qam(
+    values: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> torch.Tensor:
+    if mask is None:
+        return values.mean()
+    return (values * mask).sum() / mask.sum().clamp_min(1.0)

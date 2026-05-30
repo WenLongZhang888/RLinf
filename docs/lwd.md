@@ -12,8 +12,8 @@ P2  critic 前向 (Q_φ)
     P2.4 ⏳ TD loss + target critic + critic optimizer（worker 侧）
 P3  actor 训练
     P3.2 ✅ qam_velocity_forward（单模型 velocity；worker 持有两份模型实例）
-    P3.3 ⏳ adjoint state 反向积分（最难）
-    P3.4 ⏳ QAM actor loss
+    P3.3 ✅ compute_adjoint_states 反向积分 + 单测（含 state-dependent toy）
+    P3.4 🟡 QAM actor loss ✅（σ 已对齐官方 h-shift）/ 前向 SDE sampler + objective ⏳
     P3.5 ⏳ EmbodiedQAMFSDPPolicy worker（同 SAC target_model 模式）
 P5  ⏳ YAML + smoke + LIBERO eval
 ```
@@ -24,8 +24,13 @@ LWD 论文公式 (9) —— V1 实现按此对齐：
 
 ```text
 L_QAM(θ) = E[ ∫₀¹ ‖(f_θ - f_β) · 2/σ_w + σ_w · g̃_w‖² dw ]
-σ_w = √(2(1-w)),   g̃_1 = -∇_a [Q_φ(z_t, a¹) / λ]
+σ_w = √(2(1-w)/w),   g̃_1 = -∇_a [Q_φ(z_t, a¹) / λ]
 ```
+
+> ⚠️ σ 必须与 adjoint 反向积分用的漂移 `b = 2f_β - a/t`（QAM 前向 SDE，见
+> `qam_training_flow.md` Eq.19）取自**同一条 SDE**，所以是 √(2(1-w)/w)，不是
+> √(2(1-w))。代码 (`compute_qam_actor_loss`) 用官方 QAM 的 h-shift 数值安全写法
+> `σ_w = √(2(1-w+h)/(w+h))`，`h = 1/W`，在 w=0 与 w=1 两端都有限。
 
 ---
 

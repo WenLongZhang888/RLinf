@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from rlinf.algorithms.embodiment.qam import compute_adjoint_states
+from rlinf.algorithms.embodiment.qam import (
+    compute_adjoint_states,
+    compute_qam_actor_loss,
+)
 
-__all__ = ["compute_adjoint_states"]
+__all__ = ["compute_adjoint_states", "compute_qam_actor_loss"]

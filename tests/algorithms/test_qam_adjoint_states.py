@@ -89,6 +89,49 @@ def test_compute_adjoint_states_linear_field_uses_full_drift_vjp():
     assert torch.allclose(adjs, expected_adjs)
 
 
+def test_compute_adjoint_states_state_dependent_jacobian_uses_source_state():
+    """f_beta(x)=x^2 has a state-dependent Jacobian, so the VJP must be taken at
+    the source state traj[step] (QAM paper Eq. 25), not traj[step-1]."""
+    torch.manual_seed(2)
+    num_steps = 4
+    xs = torch.randn(num_steps + 1, 2, 2, 3, dtype=torch.float64)
+    q_grad_at_1 = torch.randn_like(xs[-1])
+
+    def f_beta_fn(obs, x_t, timestep):
+        # Elementwise square -> Jacobian diag(2 x), i.e. genuinely depends on x.
+        return x_t * x_t
+
+    _, adjs = compute_adjoint_states(
+        f_beta_fn=f_beta_fn,
+        obs=None,
+        xs=xs,
+        Q_grad_at_1=q_grad_at_1,
+        lambda_=1.0,
+    )
+
+    # b_beta = 2 x^2 - x / t  ->  d b/d x = diag(4 x - 1/t).
+    # Reference linearizes at the SOURCE state xs[step] with t = step/W.
+    h = 1.0 / num_steps
+    expected = [torch.empty_like(q_grad_at_1)] * (num_steps + 1)
+    expected[-1] = -q_grad_at_1
+    for step in range(num_steps, 0, -1):
+        timestep = step / num_steps
+        jac_diag = 4.0 * xs[step] - 1.0 / timestep
+        expected[step - 1] = expected[step] + h * jac_diag * expected[step]
+    expected_adjs = torch.stack(expected, dim=0)
+
+    assert torch.allclose(adjs, expected_adjs)
+
+    # Sanity: evaluating at the WRONG state (traj[step-1]) would differ.
+    wrong = [torch.empty_like(q_grad_at_1)] * (num_steps + 1)
+    wrong[-1] = -q_grad_at_1
+    for step in range(num_steps, 0, -1):
+        timestep = step / num_steps
+        jac_diag = 4.0 * xs[step - 1] - 1.0 / timestep
+        wrong[step - 1] = wrong[step] + h * jac_diag * wrong[step]
+    assert not torch.allclose(adjs, torch.stack(wrong, dim=0))
+
+
 def test_compute_adjoint_states_rejects_invalid_inputs():
     xs = torch.zeros(3, 2, 3, 4)
     q_grad = torch.zeros_like(xs[-1])
