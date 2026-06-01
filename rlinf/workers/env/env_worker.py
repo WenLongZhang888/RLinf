@@ -191,9 +191,16 @@ class EnvWorker(Worker):
                 "language."
             )
             return
-        max_len = int(
-            self.cfg.actor.model.get("paligemma_max_token_len", 48)
-        )
+        model_cfg = self.cfg.actor.model
+        openpi_cfg = model_cfg.get("openpi", {})
+        config_name = openpi_cfg.get("config_name", "")
+
+        if model_cfg.get("paligemma_max_token_len") is not None:
+            max_len = int(model_cfg.paligemma_max_token_len)
+        elif "pi05_" in config_name:
+            max_len = 200
+        else:
+            max_len = 48
         self._language_tokenizer = PaligemmaTokenizer(max_len=max_len)
         self.log_info(
             f"env_worker: PaligemmaTokenizer initialized (max_len={max_len})."

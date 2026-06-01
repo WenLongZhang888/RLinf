@@ -370,14 +370,15 @@ def compute_adjoint_states(
             velocity = velocity.to(device=input_x.device, dtype=input_x.dtype)
             return 2.0 * velocity - input_x / _time_like(timestep, input_x)
 
-        _, vjp_x = torch.autograd.functional.vjp(
-            beta_drift_at_x,
-            x_t,
-            v=adj_next,
-            create_graph=False,
-            strict=False,
-        )
-        adjs[step - 1] = (adj_next + h * vjp_x).detach()
+        x_t = traj[step].detach().requires_grad_(True)
+        adj_next = adjs[step].detach()
+
+        drift = beta_drift_at_x(x_t)
+        x_t.grad = None
+        torch.autograd.backward(drift, grad_tensors=adj_next)
+        vjp_x = x_t.grad
+        if vjp_x is None:
+            raise RuntimeError("Failed to compute QAM adjoint VJP.")
 
     return traj, torch.stack(adjs, dim=0)
 

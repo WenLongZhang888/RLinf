@@ -252,7 +252,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             _qam_dtype = torch.bfloat16
             pooled_z_dim = 2048 if "pi05_" in self.config.config_name else 1024
             action_feature_dim = (
-                self.config.action_horizon*self.config.action_env_dim
+                self.config.action_chunk * self.config.action_env_dim
             )
             self.q_head_qam = MultiQHead(
                 hidden_size = pooled_z_dim,

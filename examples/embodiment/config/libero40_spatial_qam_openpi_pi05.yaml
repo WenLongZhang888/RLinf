@@ -45,7 +45,7 @@ algorithm:
   tau: 0.005
   update_epoch: 1
   critic_actor_ratio: 1     # smoke: run actor every critic step to cover the actor path
-  target_update_freq: 1
+  target_update_freq: -1
   target_update_type: q_head_only
   bootstrap_type: standard
   train_actor_steps: 2      # start training the actor once buffer has 2 trajectories
@@ -120,6 +120,7 @@ actor:
   model:
     model_path: "/mnt/kpfs/zhangwenlong/RLinf/.checkpoints/lwd2/openpi/pi05_libero_40_sft_pytorch" # https://huggingface.co/RLinf/RLinf-Pi05-LIBERO-SFT
     model_type: "openpi"
+    paligemma_max_token_len: 200
     num_action_chunks: 5 # interface for the env
     action_dim: 7 # env/critic action dim; OpenPI flow internals stay 32-D
     num_steps: 10

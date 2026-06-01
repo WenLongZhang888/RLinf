@@ -365,15 +365,22 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
 
         def q_grad_fn(x1):
             critic_action = self._critic_actions_from_flow(x1.detach()).clamp(-1.0, 1.0)
-            flat_action = critic_action.reshape(x1.shape[0], -1)
+            flat_action = critic_action.reshape(x1.shape[0], -1).detach()
             flat_action.requires_grad_(True)
+
             q_values = self.target_model(
                 forward_type=ForwardType.QAM_Q,
                 obs=obs,
                 actions=flat_action,
             )
             q_mean = qam_reduce_ensemble(q_values, reduction="mean", keepdim=True)
-            (grad,) = torch.autograd.grad(q_mean.sum(), flat_action)
+
+            flat_action.grad = None
+            q_mean.sum().backward()
+            grad = flat_action.grad
+            if grad is None:
+                raise RuntimeError("Failed to compute QAM terminal action gradient.")
+
             grad_critic = grad.reshape_as(critic_action)
             grad_flow = torch.zeros_like(x1)
             grad_flow[:, : grad_critic.shape[1], : grad_critic.shape[2]] = (
@@ -382,6 +389,85 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
             return grad_flow.detach()
 
         return f_theta_fn, f_beta_fn, q_grad_fn
+    
+    @staticmethod
+    def _canonical_qam_q_head_name(name: str) -> str | None:
+        marker = "q_head_qam."
+        if marker not in name:
+            return None
+        return name.split(marker, 1)[1]
+
+    @classmethod
+    def _collect_qam_q_head_params(cls, model, clone: bool = False):
+        """Collect q_head_qam params with FSDP-stable relative names."""
+        params = {}
+
+        # FSDP may expose q_head params from the root wrapper.
+        for name, param in model.named_parameters():
+            key = cls._canonical_qam_q_head_name(name)
+            if key is not None:
+                params[key] = param.detach().clone() if clone else param
+
+        if params:
+            return params
+
+        # Fallback for cases where params still live on the unwrapped submodule.
+        module = getattr(model, "module", model)
+        module = getattr(module, "_fsdp_wrapped_module", module)
+        q_head = getattr(module, "q_head_qam", None)
+        if q_head is not None:
+            for name, param in q_head.named_parameters():
+                params[name] = param.detach().clone() if clone else param
+
+        return params
+
+    def soft_update_target_model(self, tau=None):
+        """Soft-update only QAM target critic head."""
+        if tau is None:
+            tau = self.cfg.algorithm.tau
+
+        assert self.target_model_initialized
+
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        # Clone live params while full params are summoned; FSDP views may be
+        # invalid outside the context.
+        with FSDP.summon_full_params(self.model, recurse=True, writeback=False):
+            online_params = self._collect_qam_q_head_params(self.model, clone=True)
+
+        if not online_params:
+            raise RuntimeError("No q_head_qam parameters found in live QAM model.")
+
+        with FSDP.summon_full_params(
+            self.target_model,
+            recurse=True,
+            writeback=True,
+        ):
+            target_params = self._collect_qam_q_head_params(
+                self.target_model,
+                clone=False,
+            )
+
+            if not target_params:
+                raise RuntimeError("No q_head_qam parameters found in target QAM model.")
+
+            missing = sorted(set(target_params) - set(online_params))
+            extra = sorted(set(online_params) - set(target_params))
+            if missing or extra:
+                raise RuntimeError(
+                    "QAM q_head_qam parameters do not match. "
+                    f"missing={missing[:5]}, extra={extra[:5]}"
+                )
+
+            with torch.no_grad():
+                for name, target_param in target_params.items():
+                    online_param = online_params[name].to(
+                        device=target_param.device,
+                        dtype=target_param.dtype,
+                    )
+                    target_param.mul_(1.0 - tau)
+                    target_param.add_(online_param, alpha=tau)
+
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
@@ -400,9 +486,13 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
             num_steps=num_steps,
             inv_temp=inv_temp,
         )
-        qam_metrics = {
-            key.removeprefix("actor/"): value for key, value in metrics.items()
-        }
+        qam_metrics = {}
+        for key, value in metrics.items():
+            metric_key = key.removeprefix("actor/")
+            if isinstance(value, torch.Tensor):
+                qam_metrics[metric_key] = value.detach().float().cpu().item()
+            else:
+                qam_metrics[metric_key] = float(value)
         return actor_loss, qam_metrics
 
     @Worker.timer("update_one_epoch")
