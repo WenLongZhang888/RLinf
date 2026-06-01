@@ -192,7 +192,26 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
         names = collect_param_names_need_sync(module)
         return [name for name in names if "q_head_qam" not in name]
 
-    def qam_action_shape(self, batch_size: int) -> tuple[int, int, int]:
+    def _openpi_config(self):
+        """Return the wrapped OpenPI config from the live model when available."""
+        model = getattr(self, "model", None)
+        if model is not None:
+            module = getattr(model, "module", model)
+            if hasattr(module, "config"):
+                return module.config
+            wrapped = getattr(module, "_fsdp_wrapped_module", None)
+            if wrapped is not None and hasattr(wrapped, "config"):
+                return wrapped.config
+        return None
+
+    def qam_flow_action_shape(self, batch_size: int) -> tuple[int, int, int]:
+        """Shape used by OpenPI/QAM velocity fields in model action space."""
+        openpi_config = self._openpi_config()
+        if openpi_config is not None:
+            horizon = int(getattr(openpi_config, "action_horizon"))
+            action_dim = int(getattr(openpi_config, "action_dim"))
+            return batch_size, horizon, action_dim
+
         model_cfg = self.cfg.actor.model
         openpi_cfg = model_cfg.get("openpi", {})
         horizon = int(
@@ -207,6 +226,28 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
                 ),
             )
         )
+        action_dim = int(openpi_cfg.get("action_dim", model_cfg.get("action_dim", 1)))
+        return batch_size, horizon, action_dim
+
+    def qam_critic_action_shape(self, batch_size: int) -> tuple[int, int, int]:
+        """Shape used by QAM critic/env actions after OpenPI output slicing."""
+        openpi_config = self._openpi_config()
+        if openpi_config is not None:
+            horizon = int(getattr(openpi_config, "action_chunk"))
+            action_dim = int(getattr(openpi_config, "action_env_dim"))
+            return batch_size, horizon, action_dim
+
+        model_cfg = self.cfg.actor.model
+        openpi_cfg = model_cfg.get("openpi", {})
+        horizon = int(
+            openpi_cfg.get(
+                "action_chunk",
+                model_cfg.get(
+                    "num_action_chunks",
+                    model_cfg.get("action_chunk", 1),
+                ),
+            )
+        )
         action_dim = int(
             openpi_cfg.get(
                 "action_env_dim",
@@ -214,6 +255,20 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
             )
         )
         return batch_size, horizon, action_dim
+
+    def qam_action_shape(self, batch_size: int) -> tuple[int, int, int]:
+        """Backward-compatible alias for critic/env action shape."""
+        return self.qam_critic_action_shape(batch_size)
+
+    def _critic_actions_from_flow(self, actions: torch.Tensor) -> torch.Tensor:
+        """Slice OpenPI model-space actions to critic/env action space."""
+        _, horizon, action_dim = self.qam_critic_action_shape(actions.shape[0])
+        if actions.shape[1] < horizon or actions.shape[-1] < action_dim:
+            raise ValueError(
+                "QAM flow actions must contain critic action dimensions, got "
+                f"{tuple(actions.shape)} but need at least (*, {horizon}, {action_dim})"
+            )
+        return actions[:, :horizon, :action_dim]
 
     @staticmethod
     def _infer_batch_size_from_obs(obs: dict) -> int:
@@ -224,7 +279,7 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
 
     def _sample_qam_ode_actions(self, obs: dict) -> torch.Tensor:
         """Sample target actions with deterministic OpenPI/QAM ODE rollout."""
-        action_shape = self.qam_action_shape(self._infer_batch_size_from_obs(obs))
+        action_shape = self.qam_flow_action_shape(self._infer_batch_size_from_obs(obs))
         x_t = torch.randn(action_shape, device=self.device, dtype=self.torch_dtype)
         num_steps = int(self.cfg.algorithm.get("flow_steps", 10))
         h = 1.0 / num_steps
@@ -244,7 +299,7 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
                     timestep=timestep,
                 )
                 x_t = x_t + h * velocity
-        return x_t.clamp(-1.0, 1.0)
+        return self._critic_actions_from_flow(x_t).clamp(-1.0, 1.0)
 
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):
@@ -309,7 +364,8 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
             )
 
         def q_grad_fn(x1):
-            flat_action = x1.detach().clamp(-1.0, 1.0).reshape(x1.shape[0], -1)
+            critic_action = self._critic_actions_from_flow(x1.detach()).clamp(-1.0, 1.0)
+            flat_action = critic_action.reshape(x1.shape[0], -1)
             flat_action.requires_grad_(True)
             q_values = self.target_model(
                 forward_type=ForwardType.QAM_Q,
@@ -318,14 +374,19 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
             )
             q_mean = qam_reduce_ensemble(q_values, reduction="mean", keepdim=True)
             (grad,) = torch.autograd.grad(q_mean.sum(), flat_action)
-            return grad.reshape_as(x1).detach()
+            grad_critic = grad.reshape_as(critic_action)
+            grad_flow = torch.zeros_like(x1)
+            grad_flow[:, : grad_critic.shape[1], : grad_critic.shape[2]] = (
+                grad_critic.to(dtype=grad_flow.dtype)
+            )
+            return grad_flow.detach()
 
         return f_theta_fn, f_beta_fn, q_grad_fn
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
         obs = batch["curr_obs"]
-        action_shape = self.qam_action_shape(self._infer_batch_size_from_obs(obs))
+        action_shape = self.qam_flow_action_shape(self._infer_batch_size_from_obs(obs))
         num_steps = int(self.cfg.algorithm.get("flow_steps", 10))
         inv_temp = self.cfg.algorithm.get("inv_temp", 0.3)
         f_theta_fn, f_beta_fn, q_grad_fn = self._make_qam_closures(obs)

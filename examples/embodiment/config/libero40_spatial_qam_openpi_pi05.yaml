@@ -121,7 +121,7 @@ actor:
     model_path: "/mnt/kpfs/zhangwenlong/RLinf/.checkpoints/lwd2/openpi/pi05_libero_40_sft_pytorch" # https://huggingface.co/RLinf/RLinf-Pi05-LIBERO-SFT
     model_type: "openpi"
     num_action_chunks: 5 # interface for the env
-    action_dim: 7
+    action_dim: 7 # env/critic action dim; OpenPI flow internals stay 32-D
     num_steps: 10
     add_value_head: False        # QAM uses q_head_qam, not the PPO value head
     # openpi specific parameters
@@ -131,6 +131,7 @@ actor:
       qam_num_q_heads: 2
       qam_q_hidden_dims: [512, 512]
       qam_pool_mode: mean_token
+      action_dim: 32           # internal OpenPI flow/action expert dim
       action_chunk: ${actor.model.num_action_chunks}
       action_env_dim: ${actor.model.action_dim}
       use_dsrl: False

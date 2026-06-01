@@ -133,7 +133,7 @@ def test_qam_infer_batch_size_from_obs_rejects_tensorless_obs():
         EmbodiedQAMFSDPPolicy._infer_batch_size_from_obs({"metadata": "ignored"})
 
 
-def test_qam_action_shape_prefers_openpi_model_fields():
+def test_qam_action_shape_prefers_critic_env_fields_without_model():
     worker = object.__new__(EmbodiedQAMFSDPPolicy)
     worker.cfg = OmegaConf.create(
         {
@@ -151,3 +151,45 @@ def test_qam_action_shape_prefers_openpi_model_fields():
     )
 
     assert worker.qam_action_shape(batch_size=3) == (3, 8, 6)
+    assert worker.qam_critic_action_shape(batch_size=3) == (3, 8, 6)
+
+
+class _DummyOpenPiModule:
+    def __init__(self):
+        self.config = type(
+            "Config",
+            (),
+            {
+                "action_horizon": 5,
+                "action_chunk": 5,
+                "action_dim": 32,
+                "action_env_dim": 7,
+            },
+        )()
+
+
+class _DummyFSDPWrapper:
+    def __init__(self):
+        self.module = _DummyOpenPiModule()
+
+
+def test_qam_flow_and_critic_shapes_use_distinct_openpi_dims():
+    worker = object.__new__(EmbodiedQAMFSDPPolicy)
+    worker.cfg = OmegaConf.create({"actor": {"model": {}}})
+    worker.model = _DummyFSDPWrapper()
+
+    assert worker.qam_flow_action_shape(batch_size=2) == (2, 5, 32)
+    assert worker.qam_critic_action_shape(batch_size=2) == (2, 5, 7)
+    assert worker.qam_action_shape(batch_size=2) == (2, 5, 7)
+
+
+def test_qam_critic_actions_from_flow_slices_model_action_space():
+    worker = object.__new__(EmbodiedQAMFSDPPolicy)
+    worker.cfg = OmegaConf.create({"actor": {"model": {}}})
+    worker.model = _DummyFSDPWrapper()
+    flow_actions = torch.arange(2 * 5 * 32).reshape(2, 5, 32)
+
+    critic_actions = worker._critic_actions_from_flow(flow_actions)
+
+    assert critic_actions.shape == (2, 5, 7)
+    assert torch.equal(critic_actions, flow_actions[:, :5, :7])
