@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import json
+import os
 
 import hydra
 import torch.multiprocessing as mp
+from omegaconf import open_dict
 from omegaconf.omegaconf import OmegaConf
 
 from rlinf.config import validate_cfg
@@ -28,12 +30,37 @@ from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 mp.set_start_method("spawn", force=True)
 
 
+def _resolve_eval_ckpt_path(cfg) -> None:
+    """Use an embodied training checkpoint directory for standalone eval."""
+    if cfg.runner.get("ckpt_path", None):
+        return
+    resume_dir = cfg.runner.get("resume_dir", None)
+    if not resume_dir:
+        return
+
+    candidates = [
+        os.path.join(resume_dir, "actor/model_state_dict/full_weights.pt"),
+        os.path.join(resume_dir, "model_state_dict/full_weights.pt"),
+    ]
+    for ckpt_path in candidates:
+        if os.path.exists(ckpt_path):
+            with open_dict(cfg):
+                cfg.runner.ckpt_path = ckpt_path
+            return
+
+    raise FileNotFoundError(
+        "runner.resume_dir was provided for eval, but no full model weights "
+        f"were found. Checked: {candidates}"
+    )
+
+
 @hydra.main(
     version_base="1.1", config_path="config", config_name="maniskill_ppo_openvlaoft"
 )
 def main(cfg) -> None:
     cfg.runner.only_eval = True
     cfg = validate_cfg(cfg)
+    _resolve_eval_ckpt_path(cfg)
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 
     cluster = Cluster(cluster_cfg=cfg.cluster)

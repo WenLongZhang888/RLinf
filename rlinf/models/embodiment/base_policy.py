@@ -23,6 +23,7 @@ class ForwardType(Enum):
     SAC_Q = "sac_q"
     QAM_SAMPLE = "qam_sample"
     QAM_Q = "qam_q"
+    QAM_ENCODE = "qam_encode"
     QAM_VELOCITY = "qam_velocity"
     CROSSQ = "crossq"
     CROSSQ_Q = "crossq_q"

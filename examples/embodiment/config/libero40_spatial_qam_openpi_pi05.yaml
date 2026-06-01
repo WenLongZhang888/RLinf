@@ -28,10 +28,10 @@ runner:
   max_epochs: 30          # smoke: only a few dozen steps
   max_steps: -1
   only_eval: False
-  val_check_interval: -1  # smoke: skip validation
-  save_interval: -1       # smoke: skip checkpointing
+  val_check_interval: -1  # run deterministic f_theta eval during training
+  save_interval: -1
   resume_dir: null
-  ckpt_path: null
+  ckpt_path: null         # standalone eval: actor/model_state_dict/full_weights.pt
   weight_sync_interval: 1
 
 algorithm:
@@ -45,7 +45,7 @@ algorithm:
   tau: 0.005
   update_epoch: 1
   critic_actor_ratio: 1     # smoke: run actor every critic step to cover the actor path
-  target_update_freq: -1
+  target_update_freq: 1
   target_update_type: q_head_only
   bootstrap_type: standard
   train_actor_steps: 2      # start training the actor once buffer has 2 trajectories
@@ -57,6 +57,8 @@ algorithm:
     auto_save: False
 
   # ---- QAM-specific ----
+  rollout_epoch: 1
+  eval_rollout_epoch: 1
   flow_steps: 10
   inv_temp: 0.3
   qam_target_reduction: mean_minus_std
@@ -85,6 +87,7 @@ env:
     max_episode_steps: 40
     max_steps_per_rollout_epoch: 40 # must be a multiple of num_action_chunks (5)
   eval:
+    seed: 0
     total_num_envs: 8
     auto_reset: True
     ignore_terminations: True
@@ -94,6 +97,7 @@ env:
     is_eval: True
     video_cfg:
       save_video: False
+      video_base_dir: ${runner.logger.log_path}/video/eval
 
 rollout:
   group_name: "RolloutGroup"

@@ -379,6 +379,7 @@ def compute_adjoint_states(
         vjp_x = x_t.grad
         if vjp_x is None:
             raise RuntimeError("Failed to compute QAM adjoint VJP.")
+        adjs[step - 1] = (adj_next + h * vjp_x).detach()
 
     return traj, torch.stack(adjs, dim=0)
 

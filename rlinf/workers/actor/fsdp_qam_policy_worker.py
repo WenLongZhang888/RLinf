@@ -18,9 +18,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig
+from torch.nn.utils import clip_grad_norm_
 
 from rlinf.algorithms.embodiment import compute_qam_actor_objective
 from rlinf.models.embodiment.base_policy import ForwardType
+from rlinf.models.embodiment.modules.q_head import MultiQHead
 from rlinf.scheduler import Worker
 from rlinf.utils.metric_utils import append_to_dict
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
@@ -88,50 +90,51 @@ def qam_bootstrap_target(
 class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
     """FSDP worker for plain QAM on embodied policies.
 
-    This worker reuses SAC's replay-buffer, target-model, optimizer, checkpoint,
-    and EMA machinery. It swaps SAC's entropy actor objective for QAM's
-    trajectory sampling + adjoint-matching objective and owns a third frozen
-    peer model ``f_beta_model`` for the behavior velocity field.
+    This worker reuses SAC's replay-buffer setup, swaps SAC's entropy actor
+    objective for QAM's trajectory sampling + adjoint-matching objective, and
+    owns a frozen peer model ``f_beta_model`` for the behavior velocity field.
+    QAM critic heads are plain worker-owned modules instead of FSDP-wrapped
+    target-model components.
     """
 
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
         self.f_beta_model = None
+        self.q_head_qam = None
+        self.target_q_head_qam = None
 
     def init_worker(self):
-        self.setup_model_and_optimizer(initialize_target=True)
+        self.setup_model_and_optimizer(initialize_target=False)
         self.setup_sac_components()
         self.soft_update_target_model(tau=1.0)
         if self.cfg.actor.get("enable_offload", False):
             self.offload_param_and_grad()
             self.offload_optimizer()
+            self._offload_qam_critic_components()
         if self.cfg.actor.get("compile_model", False):
             self.model = torch.compile(self.model, mode="default")
-            self.target_model = torch.compile(self.target_model, mode="default")
             self.f_beta_model = torch.compile(self.f_beta_model, mode="default")
 
     def setup_model_and_optimizer(self, initialize_target=False) -> None:
-        """Setup live actor/critic, target critic, and frozen f_beta model."""
+        """Setup live actor, independent critic heads, and frozen f_beta model."""
         module = self.model_provider_func()
-        if initialize_target:
-            target_module = self.model_provider_func()
         f_beta_module = self.model_provider_func()
 
         if self.cfg.actor.model.get("gradient_checkpointing", False):
             self.logger.info("[FSDP] Enabling gradient checkpointing")
             module.gradient_checkpointing_enable()
-            if initialize_target:
-                target_module.gradient_checkpointing_enable()
             f_beta_module.gradient_checkpointing_enable()
         else:
             self.logger.info("[FSDP] Gradient checkpointing is disabled")
 
         if hasattr(module, "freeze_vlm"):
             module.freeze_vlm()
-        if initialize_target and hasattr(target_module, "freeze_vlm"):
-            target_module.freeze_vlm()
         if hasattr(f_beta_module, "freeze_vlm"):
             f_beta_module.freeze_vlm()
+        if hasattr(module, "q_head_qam"):
+            module.q_head_qam.requires_grad_(False)
+        if hasattr(f_beta_module, "q_head_qam"):
+            f_beta_module.q_head_qam.requires_grad_(False)
 
         self.param_names_need_sync = self._collect_qam_sync_param_names(module)
 
@@ -140,13 +143,6 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
         if self.torch_dtype is None:
             self.torch_dtype = next(self.model.parameters()).dtype
-
-        if initialize_target:
-            self.target_model = self._strategy.wrap_model(
-                model=target_module, device_mesh=self._device_mesh
-            )
-            self.target_model.requires_grad_(False)
-            self.target_model_initialized = True
 
         self.f_beta_model = self._strategy.wrap_model(
             model=f_beta_module, device_mesh=self._device_mesh
@@ -158,16 +154,34 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
         if self.use_dsrl:
             raise ValueError("QAM worker does not support use_dsrl=True.")
 
-        param_filters = {"critic": ["q_head_qam"]}
-        filtered_optim_config = {"critic": self.cfg.actor.critic_optim}
-        optimizers = self.build_optimizers(
+        self.q_head_qam = self._build_qam_q_head().to(
+            device=self.device,
+            dtype=self.torch_dtype,
+        )
+        self.target_q_head_qam = self._build_qam_q_head().to(
+            device=self.device,
+            dtype=self.torch_dtype,
+        )
+        self.target_q_head_qam.load_state_dict(self.q_head_qam.state_dict())
+        self.target_q_head_qam.requires_grad_(False)
+        self.target_q_head_qam.eval()
+
+        self.optimizer = self.build_optimizers(
             model=self.model,
             main_optim_config=self.cfg.actor.optim,
-            param_filters=param_filters,
-            filtered_optim_config=filtered_optim_config,
+            param_filters={},
+            filtered_optim_config={},
+        )[0]
+        critic_optim_cfg = self.cfg.actor.critic_optim
+        self.qf_optimizer = torch.optim.Adam(
+            self.q_head_qam.parameters(),
+            lr=critic_optim_cfg.lr,
+            betas=(
+                critic_optim_cfg.get("adam_beta1", 0.9),
+                critic_optim_cfg.get("adam_beta2", 0.999),
+            ),
+            eps=critic_optim_cfg.get("adam_eps", 1e-8),
         )
-        self.optimizer = optimizers[0]
-        self.qf_optimizer = optimizers[1]
 
         self.build_lr_schedulers()
         self.grad_scaler = self.build_grad_scaler(
@@ -191,6 +205,46 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
 
         names = collect_param_names_need_sync(module)
         return [name for name in names if "q_head_qam" not in name]
+
+    def _build_qam_q_head(self):
+        """Build a worker-owned QAM critic head outside FSDP."""
+        cfg = self._openpi_config()
+        if cfg is not None:
+            config_name = getattr(cfg, "config_name")
+            action_chunk = int(getattr(cfg, "action_chunk"))
+            action_env_dim = int(getattr(cfg, "action_env_dim"))
+            hidden_dims = list(getattr(cfg, "qam_q_hidden_dims"))
+            num_q_heads = int(getattr(cfg, "qam_num_q_heads"))
+        else:
+            openpi_cfg = self.cfg.actor.model.get("openpi", {})
+            config_name = openpi_cfg.get(
+                "config_name",
+                self.cfg.actor.model.get("config_name", ""),
+            )
+            action_chunk = int(
+                openpi_cfg.get(
+                    "action_chunk",
+                    self.cfg.actor.model.get("num_action_chunks", 1),
+                )
+            )
+            action_env_dim = int(
+                openpi_cfg.get(
+                    "action_env_dim",
+                    self.cfg.actor.model.get("action_env_dim", 1),
+                )
+            )
+            hidden_dims = list(openpi_cfg.get("qam_q_hidden_dims", (512, 512)))
+            num_q_heads = int(openpi_cfg.get("qam_num_q_heads", 2))
+
+        hidden_size = 2048 if "pi05_" in config_name else 1024
+        return MultiQHead(
+            hidden_size=hidden_size,
+            action_feature_dim=action_chunk * action_env_dim,
+            hidden_dims=hidden_dims,
+            num_q_heads=num_q_heads,
+            output_dim=1,
+            train_action_encoder=False,
+        )
 
     def _openpi_config(self):
         """Return the wrapped OpenPI config from the live model when available."""
@@ -301,6 +355,26 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
                 x_t = x_t + h * velocity
         return self._critic_actions_from_flow(x_t).clamp(-1.0, 1.0)
 
+    def _qam_q_values(
+        self,
+        obs: dict,
+        actions: torch.Tensor,
+        target: bool = False,
+        detach_vlm: bool = True,
+    ) -> torch.Tensor:
+        """Evaluate QAM online or target critic head from replay obs/actions."""
+        pooled_z = self.model(
+            forward_type=ForwardType.QAM_ENCODE,
+            obs=obs,
+            detach_vlm=detach_vlm,
+        )
+        if actions.dim() == 3:
+            actions = actions.reshape(actions.shape[0], -1)
+        if actions.device != pooled_z.device or actions.dtype != pooled_z.dtype:
+            actions = actions.to(device=pooled_z.device, dtype=pooled_z.dtype)
+        q_head = self.target_q_head_qam if target else self.q_head_qam
+        return q_head(pooled_z, actions)
+
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):
         curr_obs = batch["curr_obs"]
@@ -311,10 +385,10 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
 
         with torch.no_grad():
             next_actions = self._sample_qam_ode_actions(next_obs)
-            all_qf_next_target = self.target_model(
-                forward_type=ForwardType.QAM_Q,
+            all_qf_next_target = self._qam_q_values(
                 obs=next_obs,
                 actions=next_actions,
+                target=True,
             )
             target_q_values = qam_bootstrap_target(
                 rewards=rewards,
@@ -329,10 +403,10 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
                 bootstrap_type=self.cfg.algorithm.get("bootstrap_type", "standard"),
             )
 
-        all_data_q_values = self.model(
-            forward_type=ForwardType.QAM_Q,
+        all_data_q_values = self._qam_q_values(
             obs=curr_obs,
             actions=actions,
+            target=False,
         )
         target_q_values = target_q_values.to(dtype=all_data_q_values.dtype)
         critic_loss = F.mse_loss(
@@ -368,10 +442,10 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
             flat_action = critic_action.reshape(x1.shape[0], -1).detach()
             flat_action.requires_grad_(True)
 
-            q_values = self.target_model(
-                forward_type=ForwardType.QAM_Q,
+            q_values = self._qam_q_values(
                 obs=obs,
                 actions=flat_action,
+                target=True,
             )
             q_mean = qam_reduce_ensemble(q_values, reduction="mean", keepdim=True)
 
@@ -389,85 +463,19 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
             return grad_flow.detach()
 
         return f_theta_fn, f_beta_fn, q_grad_fn
-    
-    @staticmethod
-    def _canonical_qam_q_head_name(name: str) -> str | None:
-        marker = "q_head_qam."
-        if marker not in name:
-            return None
-        return name.split(marker, 1)[1]
-
-    @classmethod
-    def _collect_qam_q_head_params(cls, model, clone: bool = False):
-        """Collect q_head_qam params with FSDP-stable relative names."""
-        params = {}
-
-        # FSDP may expose q_head params from the root wrapper.
-        for name, param in model.named_parameters():
-            key = cls._canonical_qam_q_head_name(name)
-            if key is not None:
-                params[key] = param.detach().clone() if clone else param
-
-        if params:
-            return params
-
-        # Fallback for cases where params still live on the unwrapped submodule.
-        module = getattr(model, "module", model)
-        module = getattr(module, "_fsdp_wrapped_module", module)
-        q_head = getattr(module, "q_head_qam", None)
-        if q_head is not None:
-            for name, param in q_head.named_parameters():
-                params[name] = param.detach().clone() if clone else param
-
-        return params
 
     def soft_update_target_model(self, tau=None):
         """Soft-update only QAM target critic head."""
         if tau is None:
             tau = self.cfg.algorithm.tau
 
-        assert self.target_model_initialized
-
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
-        # Clone live params while full params are summoned; FSDP views may be
-        # invalid outside the context.
-        with FSDP.summon_full_params(self.model, recurse=True, writeback=False):
-            online_params = self._collect_qam_q_head_params(self.model, clone=True)
-
-        if not online_params:
-            raise RuntimeError("No q_head_qam parameters found in live QAM model.")
-
-        with FSDP.summon_full_params(
-            self.target_model,
-            recurse=True,
-            writeback=True,
-        ):
-            target_params = self._collect_qam_q_head_params(
-                self.target_model,
-                clone=False,
-            )
-
-            if not target_params:
-                raise RuntimeError("No q_head_qam parameters found in target QAM model.")
-
-            missing = sorted(set(target_params) - set(online_params))
-            extra = sorted(set(online_params) - set(target_params))
-            if missing or extra:
-                raise RuntimeError(
-                    "QAM q_head_qam parameters do not match. "
-                    f"missing={missing[:5]}, extra={extra[:5]}"
-                )
-
-            with torch.no_grad():
-                for name, target_param in target_params.items():
-                    online_param = online_params[name].to(
-                        device=target_param.device,
-                        dtype=target_param.dtype,
-                    )
-                    target_param.mul_(1.0 - tau)
-                    target_param.add_(online_param, alpha=tau)
-
+        with torch.no_grad():
+            for target_param, online_param in zip(
+                self.target_q_head_qam.parameters(),
+                self.q_head_qam.parameters(),
+            ):
+                target_param.data.mul_(1.0 - tau)
+                target_param.data.add_(online_param.data, alpha=tau)
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
@@ -494,6 +502,18 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
             else:
                 qam_metrics[metric_key] = float(value)
         return actor_loss, qam_metrics
+
+    def _offload_qam_critic_components(self):
+        """Offload non-FSDP QAM critic heads and optimizer state to CPU."""
+        self.q_head_qam.to("cpu")
+        self.target_q_head_qam.to("cpu")
+        self._strategy.offload_optimizer(self.qf_optimizer)
+
+    def _load_qam_critic_components(self):
+        """Load non-FSDP QAM critic heads and optimizer state to this device."""
+        self.q_head_qam.to(self.device)
+        self.target_q_head_qam.to(self.device)
+        self._strategy.onload_optimizer(self.qf_optimizer, self.device)
 
     @Worker.timer("update_one_epoch")
     def update_one_epoch(self, train_actor: bool = True):
@@ -524,8 +544,9 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
         all_critic_metrics = {
             f"critic/{key}": np.mean(value) for key, value in all_critic_metrics.items()
         }
-        qf_grad_norm = self.model.clip_grad_norm_(
-            max_norm=self.cfg.actor.critic_optim.clip_grad
+        qf_grad_norm = clip_grad_norm_(
+            self.q_head_qam.parameters(),
+            max_norm=float(self.cfg.actor.critic_optim.clip_grad),
         )
         self.qf_optimizer.step()
         self.qf_lr_scheduler.step()
@@ -565,9 +586,11 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
                 }
             )
 
+        target_update_freq = int(self.cfg.algorithm.get("target_update_freq", 1))
         if (
-            self.target_model_initialized
-            and self.update_step % self.cfg.algorithm.get("target_update_freq", 1) == 0
+            self.target_q_head_qam is not None
+            and target_update_freq > 0
+            and self.update_step % target_update_freq == 0
         ):
             self.soft_update_target_model()
 
@@ -577,6 +600,7 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
         if self.cfg.actor.get("enable_offload", False):
             self.load_param_and_grad(self.device)
             self.load_optimizer(self.device)
+            self._load_qam_critic_components()
 
         min_buffer_size = self.cfg.algorithm.replay_buffer.get(
             "min_buffer_size", 100
@@ -620,7 +644,23 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
         return mean_metric_dict
 
     def save_checkpoint(self, save_base_path, step):
-        super().save_checkpoint(save_base_path, step)
+        restore_weight_offload = self.is_weight_offloaded
+        restore_optimizer_offload = self.is_optimizer_offloaded
+        if restore_weight_offload:
+            self.load_param_and_grad(self.device)
+        if restore_optimizer_offload:
+            self.load_optimizer(self.device)
+            self._load_qam_critic_components()
+
+        self._strategy.save_checkpoint(
+            model=self.model,
+            optimizers=self.optimizer,
+            lr_schedulers=self.lr_scheduler,
+            save_path=save_base_path,
+            checkpoint_format="local_shard"
+            if self.cfg.actor.fsdp_config.use_orig_params
+            else "dcp",
+        )
         f_beta_save_path = os.path.join(
             save_base_path, "qam_components/f_beta_model"
         )
@@ -632,9 +672,51 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
             f_beta_state_dict,
             os.path.join(f_beta_save_path, f"checkpoint_rank_{self._rank}.pt"),
         )
+        for name, module in (
+            ("q_head_qam", self.q_head_qam),
+            ("target_q_head_qam", self.target_q_head_qam),
+        ):
+            save_path = os.path.join(save_base_path, f"qam_components/{name}")
+            os.makedirs(save_path, exist_ok=True)
+            torch.save(
+                module.state_dict(),
+                os.path.join(save_path, f"checkpoint_rank_{self._rank}.pt"),
+            )
+        critic_optim_save_path = os.path.join(
+            save_base_path, "qam_components/critic_optimizer"
+        )
+        os.makedirs(critic_optim_save_path, exist_ok=True)
+        torch.save(
+            {
+                "optimizer": self.qf_optimizer.state_dict(),
+                "lr_scheduler": self.qf_lr_scheduler.state_dict(),
+            },
+            os.path.join(
+                critic_optim_save_path,
+                f"checkpoint_rank_{self._rank}.pt",
+            ),
+        )
+        buffer_save_path = os.path.join(
+            save_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
+        )
+        self.replay_buffer.save_checkpoint(buffer_save_path)
+
+        if restore_weight_offload:
+            self.offload_param_and_grad()
+        if restore_optimizer_offload:
+            self.offload_optimizer()
+            self._offload_qam_critic_components()
 
     def load_checkpoint(self, load_base_path):
-        super().load_checkpoint(load_base_path)
+        self._strategy.load_checkpoint(
+            model=self.model,
+            optimizers=self.optimizer,
+            lr_schedulers=self.lr_scheduler,
+            load_path=load_base_path,
+            checkpoint_format="local_shard"
+            if self.cfg.actor.fsdp_config.use_orig_params
+            else "dcp",
+        )
         f_beta_load_path = os.path.join(
             load_base_path, "qam_components/f_beta_model"
         )
@@ -647,3 +729,37 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
             cpu_offload=False,
             full_state_dict=True,
         )
+        for name, module in (
+            ("q_head_qam", self.q_head_qam),
+            ("target_q_head_qam", self.target_q_head_qam),
+        ):
+            load_path = os.path.join(
+                load_base_path,
+                f"qam_components/{name}/checkpoint_rank_{self._rank}.pt",
+            )
+            if not os.path.exists(load_path):
+                raise FileNotFoundError(
+                    "QAM checkpoint is missing independent critic head "
+                    f"{name!r}: {load_path}"
+            )
+            state_dict = torch.load(load_path, map_location=self.device)
+            module.load_state_dict(state_dict)
+        critic_optim_load_path = os.path.join(
+            load_base_path,
+            f"qam_components/critic_optimizer/checkpoint_rank_{self._rank}.pt",
+        )
+        if not os.path.exists(critic_optim_load_path):
+            raise FileNotFoundError(
+                "QAM checkpoint is missing independent critic optimizer: "
+                f"{critic_optim_load_path}"
+            )
+        critic_optim_state = torch.load(
+            critic_optim_load_path,
+            map_location=self.device,
+        )
+        self.qf_optimizer.load_state_dict(critic_optim_state["optimizer"])
+        self.qf_lr_scheduler.load_state_dict(critic_optim_state["lr_scheduler"])
+        buffer_load_path = os.path.join(
+            load_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
+        )
+        self.replay_buffer.load_checkpoint(buffer_load_path)

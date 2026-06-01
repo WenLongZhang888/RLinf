@@ -327,16 +327,15 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return prefix_output[:, prefix_mask, :].mean(dim=1, keepdim=False)
 
 
-    def qam_q_forward(
+    def qam_encode_obs(
         self,
         obs=None,
-        actions=None,
         data=None,
         detach_vlm: bool = True,
         train: bool = False,
         **kwargs,
     ):
-        """Critic forward Q_φ(z_t, action_chunk) for plain QAM.
+        """Encode replay obs into pooled PaliGemma features for QAM critic.
 
         Pipeline mirrors predict_action_batch but on replay obs (no raw
         ``task_descriptions`` strings — uses cached tokenized_prompt):
@@ -350,22 +349,17 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             └─ _build_prefix_cache        # PaliGemma forward
             └─ detach                     # freeze VLM grads (LWD V1 plan)
             └─ _pool_prefix_for_qam       # [B, hidden]
-            └─ q_head_qam(z_t, action)    # [B, num_q_heads]
 
         Args:
             obs: replay-format dict (main_images, states,
                 tokenized_prompt, tokenized_prompt_mask, ...).
-            actions: [B, H*A] or [B, H, A].
             detach_vlm: True (default) — plain QAM requires VLM frozen.
         """
         if not self.config.use_qam:
-            raise ValueError("qam_q_forward called but use_qam=False")
+            raise ValueError("qam_encode_obs called but use_qam=False")
 
         if obs is None:
             obs = data.get("obs", data) if data is not None else kwargs.get("obs", {})
-        if actions is None:
-            actions = kwargs.get("actions")
-        assert actions is not None, "qam_q_forward requires `actions`"
 
         to_process_obs = self._obs_processor_for_qam(obs)
         processed_obs = self.input_transform(to_process_obs, transpose=False)
@@ -381,7 +375,38 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if detach_vlm:
             prefix_output = prefix_output.detach()
 
-        pooled_z = self._pool_prefix_for_qam(prefix_output)  # [B, hidden]
+        return self._pool_prefix_for_qam(prefix_output)  # [B, hidden]
+
+    def qam_q_forward(
+        self,
+        obs=None,
+        actions=None,
+        data=None,
+        detach_vlm: bool = True,
+        train: bool = False,
+        **kwargs,
+    ):
+        """Critic forward Q_φ(z_t, action_chunk) for plain QAM.
+
+        This compatibility path keeps the model-owned QAM head usable in unit
+        tests. The QAM worker owns its online/target critic heads separately.
+        """
+        if not self.config.use_qam:
+            raise ValueError("qam_q_forward called but use_qam=False")
+
+        if obs is None:
+            obs = data.get("obs", data) if data is not None else kwargs.get("obs", {})
+        if actions is None:
+            actions = kwargs.get("actions")
+        assert actions is not None, "qam_q_forward requires `actions`"
+
+        pooled_z = self.qam_encode_obs(
+            obs=obs,
+            data=data,
+            detach_vlm=detach_vlm,
+            train=train,
+            **kwargs,
+        )
 
         if actions.dim() == 3:
             actions = actions.reshape(actions.shape[0], -1)
@@ -472,6 +497,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             return self.sac_q_forward(**kwargs)
         elif forward_type == ForwardType.QAM_Q:
             return self.qam_q_forward(**kwargs)
+        elif forward_type == ForwardType.QAM_ENCODE:
+            return self.qam_encode_obs(**kwargs)
         elif forward_type == ForwardType.QAM_VELOCITY:
             return self.qam_velocity_forward(**kwargs)
         else:

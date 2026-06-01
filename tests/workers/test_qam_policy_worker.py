@@ -14,8 +14,10 @@
 
 import pytest
 import torch
+from torch import nn
 from omegaconf import OmegaConf
 
+from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.workers.actor.fsdp_qam_policy_worker import (
     EmbodiedQAMFSDPPolicy,
     qam_bootstrap_target,
@@ -173,6 +175,24 @@ class _DummyFSDPWrapper:
         self.module = _DummyOpenPiModule()
 
 
+class _EncodeOnlyModel(nn.Module):
+    def __init__(self, pooled_z):
+        super().__init__()
+        self.pooled_z = pooled_z
+        self.calls = []
+
+    def forward(self, forward_type, **kwargs):
+        self.calls.append((forward_type, kwargs))
+        assert forward_type == ForwardType.QAM_ENCODE
+        return self.pooled_z
+
+
+class _LinearQHead(nn.Module):
+    def forward(self, pooled_z, actions):
+        del pooled_z
+        return actions.sum(dim=-1, keepdim=True)
+
+
 def test_qam_flow_and_critic_shapes_use_distinct_openpi_dims():
     worker = object.__new__(EmbodiedQAMFSDPPolicy)
     worker.cfg = OmegaConf.create({"actor": {"model": {}}})
@@ -193,3 +213,99 @@ def test_qam_critic_actions_from_flow_slices_model_action_space():
 
     assert critic_actions.shape == (2, 5, 7)
     assert torch.equal(critic_actions, flow_actions[:, :5, :7])
+
+
+def test_qam_builds_independent_target_head_from_config():
+    worker = object.__new__(EmbodiedQAMFSDPPolicy)
+    worker.cfg = OmegaConf.create(
+        {
+            "actor": {
+                "model": {
+                    "openpi": {
+                        "config_name": "pi05_libero",
+                        "action_chunk": 5,
+                        "action_env_dim": 7,
+                        "qam_q_hidden_dims": [16],
+                        "qam_num_q_heads": 2,
+                    }
+                }
+            }
+        }
+    )
+    worker.model = None
+
+    q_head = worker._build_qam_q_head()
+
+    out = q_head(torch.randn(3, 2048), torch.randn(3, 35))
+    assert isinstance(q_head, nn.Module)
+    assert out.shape == (3, 2)
+
+
+def test_qam_soft_update_target_head_tau_one_matches_online():
+    worker = object.__new__(EmbodiedQAMFSDPPolicy)
+    worker.cfg = OmegaConf.create({"algorithm": {"tau": 0.1}})
+    worker.q_head_qam = nn.Linear(3, 2)
+    worker.target_q_head_qam = nn.Linear(3, 2)
+    with torch.no_grad():
+        worker.q_head_qam.weight.fill_(2.0)
+        worker.q_head_qam.bias.fill_(3.0)
+        worker.target_q_head_qam.weight.zero_()
+        worker.target_q_head_qam.bias.zero_()
+
+    worker.soft_update_target_model(tau=1.0)
+
+    for online_param, target_param in zip(
+        worker.q_head_qam.parameters(),
+        worker.target_q_head_qam.parameters(),
+    ):
+        assert torch.allclose(target_param, online_param)
+
+
+def test_qam_soft_update_target_head_tau_half_only_changes_target():
+    worker = object.__new__(EmbodiedQAMFSDPPolicy)
+    worker.cfg = OmegaConf.create({"algorithm": {"tau": 0.1}})
+    worker.q_head_qam = nn.Linear(1, 1, bias=False)
+    worker.target_q_head_qam = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        worker.q_head_qam.weight.fill_(4.0)
+        worker.target_q_head_qam.weight.fill_(2.0)
+
+    worker.soft_update_target_model(tau=0.5)
+
+    assert torch.allclose(worker.q_head_qam.weight, torch.tensor([[4.0]]))
+    assert torch.allclose(worker.target_q_head_qam.weight, torch.tensor([[3.0]]))
+
+
+def test_qam_q_values_uses_worker_owned_online_and_target_heads():
+    pooled_z = torch.randn(2, 4)
+    worker = object.__new__(EmbodiedQAMFSDPPolicy)
+    worker.model = _EncodeOnlyModel(pooled_z)
+    worker.q_head_qam = _LinearQHead()
+    worker.target_q_head_qam = nn.Linear(3, 1, bias=False)
+    with torch.no_grad():
+        worker.target_q_head_qam.weight.fill_(2.0)
+    obs = {"states": torch.zeros(2, 1)}
+    actions = torch.ones(2, 3)
+
+    online_q = worker._qam_q_values(obs, actions, target=False)
+    target_q = worker._qam_q_values(obs, actions, target=True)
+
+    assert torch.allclose(online_q, torch.full((2, 1), 3.0))
+    assert torch.allclose(target_q, torch.full((2, 1), 6.0))
+    assert not hasattr(worker, "target_model")
+
+
+def test_qam_q_grad_fn_pads_critic_gradient_to_flow_shape():
+    worker = object.__new__(EmbodiedQAMFSDPPolicy)
+    worker.cfg = OmegaConf.create({"actor": {"model": {}}})
+    worker.model = _DummyFSDPWrapper()
+    worker.f_beta_model = nn.Identity()
+    worker._qam_q_values = lambda obs, actions, target: actions.sum(dim=-1, keepdim=True)
+    obs = {"states": torch.zeros(2, 1)}
+
+    _, _, q_grad_fn = worker._make_qam_closures(obs)
+    grad_flow = q_grad_fn(torch.zeros(2, 5, 32))
+
+    assert grad_flow.shape == (2, 5, 32)
+    assert torch.allclose(grad_flow[:, :, :7], torch.ones(2, 5, 7))
+    assert torch.allclose(grad_flow[:, :, 7:], torch.zeros(2, 5, 25))
