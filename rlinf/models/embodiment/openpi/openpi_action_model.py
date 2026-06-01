@@ -1292,10 +1292,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         )
 
         # Device/dtype/shape normalization on flow inputs.
-        x_t = x_t.to(device=state.device, dtype=state.dtype)
+        velocity_dtype = self.action_in_proj.weight.dtype
+
+        state = state.to(device=state.device, dtype=velocity_dtype)
+        x_t = x_t.to(device=state.device, dtype=velocity_dtype)
+
         if timestep.dim() == 2 and timestep.shape[-1] == 1:
             timestep = timestep.squeeze(-1)
-        timestep = timestep.to(device=state.device, dtype=state.dtype)
+        timestep = timestep.to(device=state.device, dtype=velocity_dtype)
 
         # QAM ↔ OpenPI flow-time mirroring. QAM (LWD §III.C) uses w∈[0,1]
         # with w=0 at noise and w=1 at data; OpenPI uses t∈[0,1] with t=0
