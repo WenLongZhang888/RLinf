@@ -370,9 +370,6 @@ def compute_adjoint_states(
             velocity = velocity.to(device=input_x.device, dtype=input_x.dtype)
             return 2.0 * velocity - input_x / _time_like(timestep, input_x)
 
-        x_t = traj[step].detach().requires_grad_(True)
-        adj_next = adjs[step].detach()
-
         drift = beta_drift_at_x(x_t)
         x_t.grad = None
         torch.autograd.backward(drift, grad_tensors=adj_next)

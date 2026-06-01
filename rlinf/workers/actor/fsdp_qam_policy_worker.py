@@ -156,11 +156,11 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
 
         self.q_head_qam = self._build_qam_q_head().to(
             device=self.device,
-            dtype=self.torch_dtype,
+            dtype=torch.float32,
         )
         self.target_q_head_qam = self._build_qam_q_head().to(
             device=self.device,
-            dtype=self.torch_dtype,
+            dtype=torch.float32,
         )
         self.target_q_head_qam.load_state_dict(self.q_head_qam.state_dict())
         self.target_q_head_qam.requires_grad_(False)
@@ -201,10 +201,26 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
     @staticmethod
     def _collect_qam_sync_param_names(module):
         """Collect rollout-sync params while excluding QAM critic-only heads."""
-        from rlinf.utils.utils import collect_param_names_need_sync
+        return [
+            name
+            for name, param in module.named_parameters(remove_duplicate=False)
+            if param.requires_grad and "q_head_qam" not in name
+        ]
 
-        names = collect_param_names_need_sync(module)
-        return [name for name in names if "q_head_qam" not in name]
+    def get_rollout_state_dict(self) -> dict:
+        """Return trainable actor weights for rollout sync without FSDP export."""
+        module = getattr(self.model, "module", self.model)
+        module = getattr(module, "_fsdp_wrapped_module", module)
+        params = dict(module.named_parameters(remove_duplicate=False))
+        buffers = dict(module.named_buffers(remove_duplicate=False))
+
+        state = {}
+        for name in self.param_names_need_sync:
+            value = params.get(name, buffers.get(name))
+            if value is None:
+                raise KeyError(f"QAM rollout sync key {name!r} not found")
+            state[name] = value.detach()
+        return state
 
     def _build_qam_q_head(self):
         """Build a worker-owned QAM critic head outside FSDP."""
@@ -363,16 +379,20 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
         detach_vlm: bool = True,
     ) -> torch.Tensor:
         """Evaluate QAM online or target critic head from replay obs/actions."""
+        q_head = self.target_q_head_qam if target else self.q_head_qam
+        q_param = next(q_head.parameters())
+        critic_device = q_param.device
+        critic_dtype = q_param.dtype
+
         pooled_z = self.model(
             forward_type=ForwardType.QAM_ENCODE,
             obs=obs,
             detach_vlm=detach_vlm,
         )
+        pooled_z = pooled_z.to(device=critic_device, dtype=critic_dtype)
         if actions.dim() == 3:
             actions = actions.reshape(actions.shape[0], -1)
-        if actions.device != pooled_z.device or actions.dtype != pooled_z.dtype:
-            actions = actions.to(device=pooled_z.device, dtype=pooled_z.dtype)
-        q_head = self.target_q_head_qam if target else self.q_head_qam
+        actions = actions.to(device=critic_device, dtype=critic_dtype)
         return q_head(pooled_z, actions)
 
     @Worker.timer("forward_critic")
