@@ -58,9 +58,9 @@ done
 
 公共设置：`pi05_libero_40_sft_pytorch` checkpoint；eval `seed=0`；`num_steps=10`；`temperature_eval=0.6`。
 
-| 任务环境 | seed | chunk | num_steps | 并行环境 | eval epoch | 配置名 | Checkpoint | 5.28 成功率 | 5.29 成功率（seed0 第二次实验） | 5.29 成功率（seed0 第三次实验） | 备注 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| libero_spatial | 0 | 5 | 10 | 25 | 20 | libero40_spatial_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **84.8%** / success_at_end **76.6%** | success_once **84.4%** / success_at_end **74.6%** | success_once **83.8%** / success_at_end **76.2%** | 500 traj；episode_len=240 |
-| libero_goal | 0 | 5 | 10 | 25 | 20 | libero40_goal_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **75.8%** / success_at_end **64.8%** | success_once **75.0%** / success_at_end **63.4%** | success_once **75.6%** / success_at_end **64.4%** | 500 traj；episode_len=320 |
-| libero_object | 0 | 5 | 10 | 25 | 20 | libero40_object_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **76.6%** / success_at_end **76.4%** | success_once **72.0%** / success_at_end **71.2%** | success_once **74.2%** / success_at_end **73.4%** | 500 traj；episode_len=240 |
-| libero_10 | 0 | 10 | 10 | 25 | 20 | libero40_10_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **46.2%** / success_at_end **31.0%** | success_once **44.8%** / success_at_end **32.6%** | success_once **46.6%** / success_at_end **32.2%** | 500 traj；episode_len=480 |
+| 任务环境 | seed | chunk | num_steps | 并行环境 | eval epoch | 配置名 | Checkpoint | 5.28 成功率 | 5.29 成功率（seed0 第二次实验） | 5.29 成功率（seed0 第三次实验） | 6.1 成功率（seed0 第四次实验） | 备注 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| libero_spatial | 0 | 5 | 10 | 25 | 20 | libero40_spatial_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **84.8%** / success_at_end **76.6%** | success_once **84.4%** / success_at_end **74.6%** | success_once **83.8%** / success_at_end **76.2%** | success_once **84.8%** / success_at_end **75.4%** | 500 traj；episode_len=240 |
+| libero_goal | 0 | 5 | 10 | 25 | 20 | libero40_goal_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **75.8%** / success_at_end **64.8%** | success_once **75.0%** / success_at_end **63.4%** | success_once **75.6%** / success_at_end **64.4%** | success_once **73.0%** / success_at_end **63.8%** | 500 traj；episode_len=320 |
+| libero_object | 0 | 5 | 10 | 25 | 20 | libero40_object_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **76.6%** / success_at_end **76.4%** | success_once **72.0%** / success_at_end **71.2%** | success_once **74.2%** / success_at_end **73.4%** | success_once **73.4%** / success_at_end **72.6%** | 500 traj；episode_len=240 |
+| libero_10 | 0 | 10 | 10 | 25 | 20 | libero40_10_sft_eval_pi05 | pi05_libero_40_sft_pytorch | success_once **46.2%** / success_at_end **31.0%** | success_once **44.8%** / success_at_end **32.6%** | success_once **46.6%** / success_at_end **32.2%** | success_once **45.6%** / success_at_end **31.6%** | 500 traj；episode_len=480 |
