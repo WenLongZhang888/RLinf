@@ -102,6 +102,7 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
         self.f_beta_model = None
         self.q_head_qam = None
         self.target_q_head_qam = None
+        self._sync_params: dict[str, torch.nn.Parameter] = {}
 
     def init_worker(self):
         self.setup_model_and_optimizer(initialize_target=False)
@@ -136,7 +137,8 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
         if hasattr(f_beta_module, "q_head_qam"):
             f_beta_module.q_head_qam.requires_grad_(False)
 
-        self.param_names_need_sync = self._collect_qam_sync_param_names(module)
+        self._sync_params = self._collect_qam_sync_params(module)
+        self.param_names_need_sync = list(self._sync_params.keys())
 
         self.model = self._strategy.wrap_model(
             model=module, device_mesh=self._device_mesh
@@ -199,28 +201,22 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
 
     @staticmethod
-    def _collect_qam_sync_param_names(module):
-        """Collect rollout-sync params while excluding QAM critic-only heads."""
-        return [
-            name
+    def _collect_qam_sync_params(module):
+        """Collect trainable rollout-sync params, excluding QAM critic-only heads."""
+        return {
+            name: param
             for name, param in module.named_parameters(remove_duplicate=False)
             if param.requires_grad and "q_head_qam" not in name
-        ]
+        }
 
     def get_rollout_state_dict(self) -> dict:
         """Return trainable actor weights for rollout sync without FSDP export."""
-        module = getattr(self.model, "module", self.model)
-        module = getattr(module, "_fsdp_wrapped_module", module)
-        params = dict(module.named_parameters(remove_duplicate=False))
-        buffers = dict(module.named_buffers(remove_duplicate=False))
-
-        state = {}
-        for name in self.param_names_need_sync:
-            value = params.get(name, buffers.get(name))
-            if value is None:
-                raise KeyError(f"QAM rollout sync key {name!r} not found")
-            state[name] = value.detach()
-        return state
+        if not self._sync_params:
+            raise RuntimeError(
+                "QAM rollout sync params were not initialized; "
+                "call setup_model_and_optimizer() first."
+            )
+        return {name: param.detach() for name, param in self._sync_params.items()}
 
     def _build_qam_q_head(self):
         """Build a worker-owned QAM critic head outside FSDP."""

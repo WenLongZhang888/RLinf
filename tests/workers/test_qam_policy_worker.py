@@ -295,6 +295,60 @@ def test_qam_q_values_uses_worker_owned_online_and_target_heads():
     assert not hasattr(worker, "target_model")
 
 
+class _NestedTrainableExpert(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleDict({"0": nn.Linear(2, 2)})
+
+
+class _OpenPiLikeModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.paligemma = nn.Linear(2, 2)
+        self.gemma_expert = _NestedTrainableExpert()
+        for param in self.paligemma.parameters():
+            param.requires_grad = False
+
+
+class _InnerParamSubsetShim(_OpenPiLikeModel):
+    """Simulate nested FSDP inner module missing trainable nested params."""
+
+    def named_parameters(self, remove_duplicate=False):
+        del remove_duplicate
+        for name, param in super().named_parameters():
+            if param.requires_grad:
+                continue
+            yield name, param
+
+
+def test_qam_get_rollout_state_dict_reads_trainable_params_from_sync_refs():
+    model = _OpenPiLikeModel()
+    sync_params = EmbodiedQAMFSDPPolicy._collect_qam_sync_params(model)
+
+    worker = object.__new__(EmbodiedQAMFSDPPolicy)
+    worker._sync_params = sync_params
+    worker.param_names_need_sync = list(sync_params.keys())
+
+    state = worker.get_rollout_state_dict()
+
+    assert set(state.keys()) == set(sync_params.keys())
+    assert "gemma_expert.layers.0.weight" in state
+    assert torch.allclose(
+        state["gemma_expert.layers.0.weight"],
+        model.gemma_expert.layers["0"].weight.detach(),
+    )
+
+
+def test_qam_nested_fsdp_inner_module_hides_trainable_param_names():
+    full_model = _OpenPiLikeModel()
+    inner = _InnerParamSubsetShim()
+    sync_params = EmbodiedQAMFSDPPolicy._collect_qam_sync_params(full_model)
+
+    inner_params = dict(inner.named_parameters())
+    for name in sync_params:
+        assert name not in inner_params
+
+
 def test_qam_q_grad_fn_pads_critic_gradient_to_flow_shape():
     worker = object.__new__(EmbodiedQAMFSDPPolicy)
     worker.cfg = OmegaConf.create({"actor": {"model": {}}})
