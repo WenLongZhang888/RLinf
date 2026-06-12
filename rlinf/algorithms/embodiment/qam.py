@@ -515,11 +515,24 @@ def compute_qam_actor_loss(
         residual_abs = _masked_mean_for_qam(residual.detach().abs(), full_mask)
         delta_abs = _masked_mean_for_qam(velocity_delta.detach().abs(), full_mask)
         adj_abs = _masked_mean_for_qam(adj.detach().abs(), full_mask)
+        # Diagnostic: split the residual into its two competing terms so their
+        # imbalance is directly observable. ``reg_term`` is the behavior
+        # regularization ``2 (f_theta - f_beta) / sigma``; ``guidance_term`` is
+        # the reward signal ``sigma * adj``. When the latter is swamped by the
+        # former, the actor only tracks f_beta and reward has no effect.
+        reg_term = velocity_delta.detach() * (2.0 / sigma)
+        guidance_term = sigma * adj
+        reg_term_abs = _masked_mean_for_qam(reg_term.abs(), full_mask)
+        guidance_term_abs = _masked_mean_for_qam(guidance_term.abs(), full_mask)
+        term_ratio = guidance_term_abs / (reg_term_abs + 1e-12)
         metrics = {
             "actor/qam_loss": loss.detach(),
             "actor/qam_residual_abs": residual_abs,
             "actor/qam_velocity_delta_abs": delta_abs,
             "actor/qam_adj_abs": adj_abs,
+            "actor/qam_reg_term_abs": reg_term_abs,
+            "actor/qam_guidance_term_abs": guidance_term_abs,
+            "actor/qam_term_ratio": term_ratio,
             "actor/qam_sigma_min": sigma.detach().min(),
             "actor/qam_sigma_max": sigma.detach().max(),
             "actor/qam_valid_count": denominator.detach(),

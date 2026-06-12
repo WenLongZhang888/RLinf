@@ -429,13 +429,35 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
             all_data_q_values,
             target_q_values.expand_as(all_data_q_values),
         )
-        return critic_loss, {
+        metrics = {
             "q_data": all_data_q_values.mean().item(),
             "q_target": target_q_values.mean().item(),
         }
+        # Diagnostic: does the critic value rewarding transitions higher than
+        # zero-reward ones? If q_data_sep stays ~0, the critic is flat and the
+        # actor can never improve regardless of inv_temp.
+        with torch.no_grad():
+            q_per_sample = all_data_q_values.mean(dim=1)  # [B]
+            pos_mask = rewards.sum(dim=-1) > 0  # [B]
+            if pos_mask.any():
+                metrics["q_data_rew_pos"] = q_per_sample[pos_mask].mean().item()
+            if (~pos_mask).any():
+                metrics["q_data_rew_zero"] = q_per_sample[~pos_mask].mean().item()
+            if pos_mask.any() and (~pos_mask).any():
+                metrics["q_data_sep"] = (
+                    metrics["q_data_rew_pos"] - metrics["q_data_rew_zero"]
+                )
+        return critic_loss, metrics
 
     def _make_qam_closures(self, obs: dict):
-        """Build trainable actor, frozen behavior, and target critic closures."""
+        """Build trainable actor, frozen behavior, and target critic closures.
+
+        Also returns a ``diag`` dict that ``q_grad_fn`` populates with the raw
+        terminal ``|dQ/da|`` (before any ``1 / inv_temp`` scaling). Comparing it
+        to the logged ``qam_adj_abs`` separates a flat critic (tiny dQ/da) from
+        ``inv_temp`` shrinking an otherwise-healthy gradient.
+        """
+        diag: dict[str, torch.Tensor] = {}
 
         def f_theta_fn(obs_payload, x_t, timestep):
             return self.model(
@@ -471,6 +493,8 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
             if grad is None:
                 raise RuntimeError("Failed to compute QAM terminal action gradient.")
 
+            diag["q_grad_abs"] = grad.detach().abs().mean()
+
             grad_critic = grad.reshape_as(critic_action)
             grad_flow = torch.zeros_like(x1)
             grad_flow[:, : grad_critic.shape[1], : grad_critic.shape[2]] = (
@@ -478,7 +502,7 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
             )
             return grad_flow.detach()
 
-        return f_theta_fn, f_beta_fn, q_grad_fn
+        return f_theta_fn, f_beta_fn, q_grad_fn, diag
 
     def soft_update_target_model(self, tau=None):
         """Soft-update only QAM target critic head."""
@@ -499,7 +523,7 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
         action_shape = self.qam_flow_action_shape(self._infer_batch_size_from_obs(obs))
         num_steps = int(self.cfg.algorithm.get("flow_steps", 10))
         inv_temp = self.cfg.algorithm.get("inv_temp", 0.3)
-        f_theta_fn, f_beta_fn, q_grad_fn = self._make_qam_closures(obs)
+        f_theta_fn, f_beta_fn, q_grad_fn, qam_diag = self._make_qam_closures(obs)
 
         actor_loss, metrics = compute_qam_actor_objective(
             f_theta_fn=f_theta_fn,
@@ -510,6 +534,9 @@ class EmbodiedQAMFSDPPolicy(EmbodiedSACFSDPPolicy):
             num_steps=num_steps,
             inv_temp=inv_temp,
         )
+        # Raw |dQ/da| captured by q_grad_fn before the 1/inv_temp scaling.
+        if "q_grad_abs" in qam_diag:
+            metrics["actor/qam_q_grad_abs"] = qam_diag["q_grad_abs"]
         qam_metrics = {}
         for key, value in metrics.items():
             metric_key = key.removeprefix("actor/")

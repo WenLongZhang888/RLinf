@@ -14,8 +14,8 @@
 
 import pytest
 import torch
-from torch import nn
 from omegaconf import OmegaConf
+from torch import nn
 
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.workers.actor.fsdp_qam_policy_worker import (
@@ -357,9 +357,12 @@ def test_qam_q_grad_fn_pads_critic_gradient_to_flow_shape():
     worker._qam_q_values = lambda obs, actions, target: actions.sum(dim=-1, keepdim=True)
     obs = {"states": torch.zeros(2, 1)}
 
-    _, _, q_grad_fn = worker._make_qam_closures(obs)
+    _, _, q_grad_fn, diag = worker._make_qam_closures(obs)
     grad_flow = q_grad_fn(torch.zeros(2, 5, 32))
 
     assert grad_flow.shape == (2, 5, 32)
     assert torch.allclose(grad_flow[:, :, :7], torch.ones(2, 5, 7))
     assert torch.allclose(grad_flow[:, :, 7:], torch.zeros(2, 5, 25))
+    # Diagnostics capture the raw |dQ/da| before any 1/inv_temp scaling.
+    assert "q_grad_abs" in diag
+    assert torch.allclose(diag["q_grad_abs"], torch.tensor(1.0))
