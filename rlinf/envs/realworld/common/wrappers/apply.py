@@ -45,6 +45,31 @@ from rlinf.envs.realworld.common.wrappers.reward_done_wrapper import (
 from rlinf.envs.realworld.common.wrappers.spacemouse_intervention import (
     SpacemouseIntervention,
 )
+from rlinf.envs.realworld.common.wrappers.teleop_intervention import (
+    TeleopInterventionWrapper,
+)
+from rlinf.envs.realworld.common.wrappers.vr_intervention import (
+    VRTeleopIntervention,
+)
+
+# Keyword arguments accepted by ``VRArmTeleop`` — used to filter the shared
+# ``vr_config`` block (which may also carry gripper-only keys like
+# ``gripper_threshold`` and the wrapper-level ``hold_time``).
+_VR_ARM_TELEOP_KEYS = frozenset(
+    {
+        "side",
+        "workspace_limits",
+        "ema_trans",
+        "ema_rot",
+        "translation_scale",
+        "xyz_scale",
+        "track_rotation",
+        "max_step_m",
+        "max_rot_deg",
+        "dummy_on_missing",
+        "motion_threshold",
+    }
+)
 
 
 def _load_dexhand_intervention():
@@ -64,11 +89,45 @@ def _load_dexhand_intervention():
     return DexHandIntervention
 
 
-def _validate_teleop_mode(use_spacemouse: bool, use_gello: bool) -> None:
-    if use_spacemouse and use_gello:
+def _teleop_mode(cfg: Mapping[str, Any], *, default_spacemouse: bool = True) -> str:
+    mode = cfg.get("teleop_mode", None)
+    if mode is not None:
+        return str(mode).lower()
+    legacy_keys = ("use_spacemouse", "use_vr", "use_gello")
+    explicit_enabled = [
+        name
+        for name, key in (
+            ("spacemouse", "use_spacemouse"),
+            ("vr", "use_vr"),
+            ("gello", "use_gello"),
+        )
+        if key in cfg and bool(cfg.get(key))
+    ]
+    if any(key in cfg for key in legacy_keys):
+        enabled = explicit_enabled
+    elif default_spacemouse:
+        enabled = ["spacemouse"]
+    else:
+        enabled = []
+    if len(enabled) > 1:
         raise ValueError(
-            "Only one teleop mode can be active at a time. "
-            "Set exactly one of use_spacemouse, use_gello to True."
+            "Only one teleop input can be active at a time. "
+            f"Got enabled inputs: {enabled}. Prefer teleop_mode."
+        )
+    if "vr" in enabled:
+        return "vr"
+    if "gello" in enabled:
+        return "gello"
+    if "spacemouse" in enabled:
+        return "spacemouse"
+    return "none"
+
+
+def _validate_teleop_mode(mode: str) -> None:
+    if mode not in {"none", "spacemouse", "vr", "gello"}:
+        raise ValueError(
+            "teleop_mode must be one of 'none', 'spacemouse', 'vr', or 'gello'. "
+            f"Got {mode!r}."
         )
 
 
@@ -88,18 +147,18 @@ def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
         getattr(getattr(env, "config", None), "end_effector_type", "franka_gripper")
     )
     is_dex_hand = end_effector_type.endswith("hand")
+    is_revo2_hand = end_effector_type == "revo2_hand"
 
     no_gripper = cfg.get("no_gripper", True)
     if no_gripper and not is_dex_hand:
         env = GripperCloseEnv(env)
 
-    use_spacemouse = cfg.get("use_spacemouse", True)
-    use_gello = cfg.get("use_gello", False)
-    _validate_teleop_mode(use_spacemouse, use_gello)
+    mode = _teleop_mode(cfg)
+    _validate_teleop_mode(mode)
 
     gripper_enabled = not no_gripper
 
-    if not env.config.is_dummy and use_spacemouse:
+    if not env.config.is_dummy and mode == "spacemouse":
         if is_dex_hand:
             glove_cfg = cfg.get("glove_config", {})
             DexHandIntervention = _load_dexhand_intervention()
@@ -111,9 +170,46 @@ def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
                 glove_config_file=glove_cfg.get("config_file", None),
             )
         else:
-            env = SpacemouseIntervention(env, gripper_enabled=gripper_enabled)
+            spacemouse_cfg = cfg.get("spacemouse_config", {})
+            env = SpacemouseIntervention(
+                env,
+                gripper_enabled=gripper_enabled,
+                **spacemouse_cfg,
+            )
 
-    if not env.config.is_dummy and use_gello:
+    if not env.config.is_dummy and mode == "vr":
+        vr_cfg = dict(cfg.get("vr_config", {}))
+        if is_revo2_hand:
+            # VR arm teleop composed with Revo2 hand retargeting through the
+            # generic wrapper. ``vr_config`` drives the arm; ``hand_teleop_config``
+            # (mode, thumb_opposition, engage_threshold) drives the hand.
+            from rlinf.envs.realworld.common.teleop import (
+                VRArmTeleop,
+                VRHandRetargetTeleop,
+            )
+
+            hold_time = float(vr_cfg.get("hold_time", 0.5))
+            arm_kwargs = {k: v for k, v in vr_cfg.items() if k in _VR_ARM_TELEOP_KEYS}
+            hand_cfg = dict(cfg.get("hand_teleop_config", {}))
+            env = TeleopInterventionWrapper(
+                env,
+                VRArmTeleop(**arm_kwargs),
+                VRHandRetargetTeleop(**hand_cfg),
+                hold_time=hold_time,
+            )
+        elif is_dex_hand:
+            raise ValueError(
+                "teleop_mode='vr' is only supported for gripper or "
+                "'revo2_hand' end-effectors."
+            )
+        else:
+            env = VRTeleopIntervention(
+                env,
+                gripper_enabled=gripper_enabled,
+                **vr_cfg,
+            )
+
+    if not env.config.is_dummy and mode == "gello":
         if is_dex_hand:
             raise ValueError("use_gello=True is not supported for ruiyan_hand.")
         gello_port = cfg.get("gello_port", None)
@@ -142,16 +238,18 @@ def apply_dual_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
             "Set env.eval.no_gripper=False (or env.train.no_gripper=False)."
         )
 
-    use_spacemouse = cfg.get("use_spacemouse", True)
-    use_gello = cfg.get("use_gello", False)
-    _validate_teleop_mode(use_spacemouse, use_gello)
+    mode = _teleop_mode(cfg)
+    _validate_teleop_mode(mode)
 
     gripper_enabled = True
 
-    if not env.config.is_dummy and use_spacemouse:
+    if not env.config.is_dummy and mode == "spacemouse":
         env = DualSpacemouseIntervention(env, gripper_enabled=gripper_enabled)
 
-    if not env.config.is_dummy and use_gello:
+    if not env.config.is_dummy and mode == "vr":
+        raise ValueError("teleop_mode='vr' is not implemented for dual-arm envs.")
+
+    if not env.config.is_dummy and mode == "gello":
         left_port = cfg.get("left_gello_port", None)
         right_port = cfg.get("right_gello_port", None)
         if left_port is None or right_port is None:

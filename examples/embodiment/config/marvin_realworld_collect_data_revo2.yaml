@@ -1,0 +1,68 @@
+defaults:
+  - env/marvin_realworld_peg_insertion_revo2@env.eval
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env:
+      node_group: marvin
+      placement: 0
+  node_groups:
+    - label: marvin
+      node_ranks: 0
+      hardware:
+        type: Marvin
+        configs:
+          - robot_ip: ${oc.env:MARVIN_ROBOT_IP,192.168.71.190}
+            node_rank: 0
+            camera_serials: ${oc.decode:${oc.env:MARVIN_CAMERA_SERIALS,[]}}
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: null
+    project_name: rlinf
+    experiment_name: "collect-marvin-revo2-data"
+    logger_backends: ["tensorboard"]
+  num_data_episodes: 20
+  record_task_description: False
+
+env:
+  group_name: "EnvGroup"
+  eval:
+    ignore_terminations: False
+    auto_reset: False
+    # VR teleop -> arm + Revo2 hand. Total action dim = 12 (6 arm + 6 hand).
+    teleop_mode: vr
+    use_spacemouse: False
+    use_vr: True
+    max_episode_steps: 10000
+    override_cfg:
+      # Swap the default Marvin gripper for the Revo2 dexterous hand.
+      end_effector_type: revo2_hand
+      revo2_hand_config:
+        side: right
+        port: null          # null -> SDK auto-detect
+        baudrate: 460800
+        slave_id: null       # null -> side default (left=0x7E, right=0x7F)
+        speed: 1000
+      target_ee_pose: [0.48537828, -0.24391559, 0.17181447, -1.5444949, -0.0084113264, -3.1288216]
+      success_hold_steps: 1
+
+    data_collection:
+      enabled: True
+      save_dir: ${runner.logger.log_path}/collected_data
+      export_format: "pickle"
+      only_success: True
+      robot_type: "marvin"
+      # Recorded actions are 12-D (6 arm + 6 normalized Revo2 finger targets);
+      # the hand state is the 6-D normalized target vector.
+      fps: 10

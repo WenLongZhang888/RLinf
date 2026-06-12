@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,20 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .revo2_hand import Revo2Hand
-from .revo2_mapping import (
-    Revo2FingerTargets,
-    compute_revo2_targets,
-    normalize_hand_mode,
-    to_sdk_positions,
-)
-from .ruiyan_hand import RuiyanHand
+from .marvin_gripper import MarvinGripper
 
-__all__ = [
-    "RuiyanHand",
-    "Revo2Hand",
-    "Revo2FingerTargets",
-    "compute_revo2_targets",
-    "normalize_hand_mode",
-    "to_sdk_positions",
-]
+__all__ = ["MarvinGripper"]

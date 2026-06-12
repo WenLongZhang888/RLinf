@@ -128,6 +128,32 @@ franka = [
     "numpy<2",
     "lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5"
 ]
+marvin = [
+    "gymnasium==0.29.1",
+    "pyrealsense2",
+    "opencv-python",
+    "scipy",
+    "pyspacemouse>=2.0.0",
+    "imageio[ffmpeg]",
+    "evdev",
+    "pyserial",
+    "numpy<2",
+]
+# Marvin + PICO VR + BrainCo Revo2 dexterous hand. Superset of `marvin` plus
+# the Revo2 hand SDK. The xrobotoolkit_sdk (VR) is built from source by
+# requirements/install.sh, not pulled here.
+marvin_vr_hand = [
+    "gymnasium==0.29.1",
+    "pyrealsense2",
+    "opencv-python",
+    "scipy",
+    "pyspacemouse>=2.0.0",
+    "imageio[ffmpeg]",
+    "evdev",
+    "numpy<2",
+    "bc-stark-sdk>=1.4.2",
+    "colorlog>=6.10.1",
+]
 xsquare_turtle2 = [
     "pyyaml",
     "rospkg",
@@ -164,6 +190,8 @@ conflicts = [
       { extra = "agentic-vllm" },
       { extra = "embodied" },
       { extra = "franka" },
+      { extra = "marvin" },
+      { extra = "marvin_vr_hand" },
       { extra = "xsquare_turtle2" },
       { extra = "gim_arm" }
     ],

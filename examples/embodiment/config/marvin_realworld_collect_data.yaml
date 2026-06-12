@@ -1,0 +1,57 @@
+defaults:
+  - env/marvin_realworld_peg_insertion@env.eval
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env:
+      node_group: marvin
+      placement: 0
+  node_groups:
+    - label: marvin
+      node_ranks: 0
+      hardware:
+        type: Marvin
+        configs:
+          - robot_ip: ${oc.env:MARVIN_ROBOT_IP,192.168.71.190}
+            node_rank: 0
+            camera_serials: ${oc.decode:${oc.env:MARVIN_CAMERA_SERIALS,[]}}
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: null
+    project_name: rlinf
+    experiment_name: "collect-marvin-data"
+    logger_backends: ["tensorboard"]
+  num_data_episodes: 20
+  record_task_description: False
+
+env:
+  group_name: "EnvGroup"
+  eval:
+    ignore_terminations: False
+    auto_reset: False
+    teleop_mode: spacemouse
+    use_spacemouse: False
+    use_vr: False
+    max_episode_steps: 10000
+    override_cfg:
+      target_ee_pose: [0.48537828, -0.24391559, 0.17181447, -1.5444949, -0.0084113264, -3.1288216]
+      success_hold_steps: 1
+
+    data_collection:
+      enabled: True
+      save_dir: ${runner.logger.log_path}/collected_data
+      export_format: "pickle"
+      only_success: True
+      robot_type: "marvin"
+      fps: 10

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import threading
+from typing import Optional
 
 import numpy as np
 
@@ -24,23 +25,53 @@ class SpaceMouseExpert:
     a "get_action" method to get the latest action and button state.
     """
 
-    def __init__(self, device_index: int = 0) -> None:
-        import pyspacemouse
+    def __init__(
+        self,
+        device_index: int = 0,
+        axis_mapping: Optional[list[int]] = None,
+        axis_remap: Optional[list[tuple[int, int]]] = None,
+    ) -> None:
+        try:
+            import pyspacemouse
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "SpaceMouse teleoperation requires optional dependency "
+                "'pyspacemouse'. Install the matching real-world teleop extra "
+                "or run requirements/install.sh with a spacemouse target."
+            ) from exc
 
         self._device = pyspacemouse.open(device_index=device_index)
+        if self._device is None:
+            raise RuntimeError(
+                f"Failed to open SpaceMouse device at index {device_index}. "
+                "Check that the device is connected and readable by this user."
+            )
+        self._axis_mapping = axis_mapping
+        self._axis_remap = axis_remap
 
         self.state_lock = threading.Lock()
         self.latest_data: dict = {"action": np.zeros(6), "buttons": [0, 0]}
         self.thread = threading.Thread(target=self._read_spacemouse, daemon=True)
         self.thread.start()
 
+    def _remap_action(self, action: np.ndarray) -> np.ndarray:
+        if self._axis_mapping is not None:
+            action = action[np.asarray(self._axis_mapping, dtype=np.int64)]
+        if self._axis_remap is not None:
+            action = np.asarray(
+                [sign * action[src_index] for src_index, sign in self._axis_remap],
+                dtype=np.float64,
+            )
+        return action
+
     def _read_spacemouse(self) -> None:
         while True:
             state = self._device.read()
             with self.state_lock:
-                self.latest_data["action"] = np.array(
+                action = np.array(
                     [-state.y, state.x, state.z, -state.roll, -state.pitch, -state.yaw]
                 )  # spacemouse axis matched with robot base frame
+                self.latest_data["action"] = self._remap_action(action)
                 self.latest_data["buttons"] = state.buttons
 
     def get_action(self) -> tuple[np.ndarray, list]:

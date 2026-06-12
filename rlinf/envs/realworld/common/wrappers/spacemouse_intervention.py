@@ -27,11 +27,22 @@ def sample_gripper_action(is_open: bool) -> np.ndarray:
 
 
 class SpacemouseIntervention(gym.ActionWrapper):
-    def __init__(self, env, gripper_enabled: bool = True):
+    def __init__(
+        self,
+        env,
+        gripper_enabled: bool = True,
+        device_index: int = 0,
+        axis_mapping: list[int] | None = None,
+        axis_remap: list[tuple[int, int]] | None = None,
+    ):
         super().__init__(env)
 
         self.gripper_enabled = gripper_enabled
-        self.expert = SpaceMouseExpert()
+        self.expert = SpaceMouseExpert(
+            device_index=device_index,
+            axis_mapping=axis_mapping,
+            axis_remap=axis_remap,
+        )
         self.last_intervene = 0
         self.left, self.right = False, False
         self.gripper_action = None
@@ -40,7 +51,14 @@ class SpacemouseIntervention(gym.ActionWrapper):
 
     def _sync_gripper_action(self) -> None:
         """Align the cached gripper command with the env gripper state."""
-        state = self.get_wrapper_attr("_franka_state")
+        state = None
+        for attr_name in ("_franka_state", "_marvin_state", "_state", "robot_state"):
+            try:
+                state = self.get_wrapper_attr(attr_name)
+            except AttributeError:
+                continue
+            if hasattr(state, "gripper_open"):
+                break
         is_open = bool(getattr(state, "gripper_open", True))
         self.gripper_action = sample_gripper_action(is_open=is_open)
 

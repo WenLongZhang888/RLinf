@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,20 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .revo2_hand import Revo2Hand
-from .revo2_mapping import (
-    Revo2FingerTargets,
-    compute_revo2_targets,
-    normalize_hand_mode,
-    to_sdk_positions,
-)
-from .ruiyan_hand import RuiyanHand
+"""Composable teleoperation sources (arm x end-effector)."""
+
+from .arm import SpaceMouseArmTeleop, VRArmTeleop
+from .ee import ButtonGripperTeleop, VRHandRetargetTeleop, VRTriggerGripperTeleop
+from .protocols import ArmReading, ArmTeleop, EEReading, EndEffectorTeleop
 
 __all__ = [
-    "RuiyanHand",
-    "Revo2Hand",
-    "Revo2FingerTargets",
-    "compute_revo2_targets",
-    "normalize_hand_mode",
-    "to_sdk_positions",
+    "ArmReading",
+    "ArmTeleop",
+    "EEReading",
+    "EndEffectorTeleop",
+    "SpaceMouseArmTeleop",
+    "VRArmTeleop",
+    "ButtonGripperTeleop",
+    "VRHandRetargetTeleop",
+    "VRTriggerGripperTeleop",
 ]

@@ -31,6 +31,8 @@ from .reward_done_wrapper import (
     KeyboardRewardDoneWrapper,
 )
 from .spacemouse_intervention import SpacemouseIntervention
+from .teleop_intervention import TeleopInterventionWrapper
+from .vr_intervention import VRTeleopIntervention
 
 if TYPE_CHECKING:
     from .dexhand_intervention import DexHandIntervention
@@ -50,6 +52,8 @@ __all__ = [
     "Quat2EulerWrapper",
     "RelativeFrame",
     "SpacemouseIntervention",
+    "TeleopInterventionWrapper",
+    "VRTeleopIntervention",
     "apply_dual_arm_wrappers",
     "apply_single_arm_wrappers",
 ]

@@ -75,8 +75,7 @@ NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
 SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "gr00t_n1d6" "dexbotic" "starvla" "lingbotvla" "dreamzero" "qwen3_vl" "abot_m0")
-SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "franka-dexhand" "frankasim" "robotwin" "habitat" "opensora" "wan" "genesis" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "dummy")
-
+SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "franka-dexhand" "frankasim" "robotwin" "habitat" "opensora" "wan" "genesis" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "marvin" "marvin_spacemouse" "marvin_vr" "marvin_vr_hand" "dummy")
 
 #=======================Utility Functions=======================
 
@@ -1442,6 +1441,18 @@ install_env_only() {
         dosw1)
             install_dosw1_env
             ;;
+        marvin)
+            install_marvin_env
+            ;;
+        marvin_spacemouse)
+            install_marvin_spacemouse_env
+            ;;
+        marvin_vr)
+            install_marvin_vr_env
+            ;;
+        marvin_vr_hand)
+            install_marvin_vr_hand_env
+            ;;
         *)
             echo "Environment '$ENV_NAME' is not supported for env-only installation." >&2
             exit 1
@@ -1676,6 +1687,110 @@ install_franka_dexhand_deps() {
 
 install_xsquare_turtle2_env() {
     uv pip install git+${GITHUB_PREFIX}https://github.com/RLinf/xsquare_turtle_basics.git
+}
+
+install_xrobotoolkit_sdk() {
+    # xrobotoolkit_sdk: C++ pybind11 binding for Pico VR headset teleoperation.
+    local xrt_dir
+    xrt_dir=$(clone_or_reuse_repo XRT_SDK_PATH "$VENV_DIR/XRoboToolkit-PC-Service-Pybind" \
+        ${GITHUB_PREFIX}https://github.com/XR-Robotics/XRoboToolkit-PC-Service-Pybind.git)
+
+    pushd "$xrt_dir" >/dev/null
+
+    uv pip install "pybind11>=2.10.0" "meshcat>=0.3.2"
+    export pybind11_DIR
+    pybind11_DIR=$(python - <<'EOF'
+import pybind11
+print(pybind11.get_cmake_dir())
+EOF
+)
+    bash setup_ubuntu.sh
+
+    popd >/dev/null
+
+    python - <<'EOF'
+import xrobotoolkit_sdk
+print("xrobotoolkit_sdk installed OK")
+EOF
+}
+
+ensure_opencv_gui_backend() {
+    # Some upstream deps pull in opencv-python-headless, which shadows the
+    # GUI-enabled wheel and makes cv2.imshow unavailable for teleop scripts.
+    local opencv_python_version
+    opencv_python_version=$(python - <<'EOF'
+import importlib.metadata as md
+try:
+    print(md.version("opencv-python"))
+except md.PackageNotFoundError:
+    print("4.11.0.86")
+EOF
+)
+
+    uv pip uninstall opencv-python-headless opencv-contrib-python-headless || true
+    uv pip install --reinstall "opencv-python==${opencv_python_version}"
+
+    python - <<'EOF'
+import cv2
+
+gui_line = next(
+    (line.strip() for line in cv2.getBuildInformation().splitlines() if "GUI:" in line),
+    "GUI: UNKNOWN",
+)
+print(gui_line)
+if "NONE" in gui_line:
+    raise SystemExit(
+        "opencv-python is still missing a GUI backend. "
+        "Please verify the environment packages were replaced correctly."
+    )
+EOF
+}
+
+install_marvin_env() {
+    uv sync --extra marvin --active $NO_INSTALL_RLINF_CMD
+
+    local marvin_sdk_root
+    local marvin_sdk_branch="master"
+    local marvin_sdk_commit="67187a3342f4e88e235ec88446af61318b618de6"
+
+    marvin_sdk_root=$(clone_or_reuse_repo MARVIN_SDK_PATH "$VENV_DIR/opt/TJ_FX_ROBOT_CONTRL_SDK" ${GITHUB_PREFIX}https://github.com/cynthia-you/TJ_FX_ROBOT_CONTRL_SDK.git -b "$marvin_sdk_branch")
+    checkout_repo_commit "$marvin_sdk_root" "$marvin_sdk_branch" "$marvin_sdk_commit"
+
+    pushd "$marvin_sdk_root" >/dev/null
+    make -B -C contrlSDK
+    make -B -C kinematicsSDK
+    cp -f contrlSDK/libMarvinSDK.so SDK_PYTHON/libMarvinSDK.so
+    cp -f kinematicsSDK/libKine.so SDK_PYTHON/libKine.so
+    popd >/dev/null
+
+    local default_kine_cfg
+    default_kine_cfg="$marvin_sdk_root/DEMO_PYTHON/ccs_m6_31.MvKDCfg"
+
+    echo "export MARVIN_SDK_PATH=$marvin_sdk_root" >> "$VENV_DIR/bin/activate"
+    echo "export MARVIN_SDK_GIT_BRANCH=$marvin_sdk_branch" >> "$VENV_DIR/bin/activate"
+    echo "export MARVIN_SDK_GIT_COMMIT=$marvin_sdk_commit" >> "$VENV_DIR/bin/activate"
+    echo "export PYTHONPATH=$marvin_sdk_root/SDK_PYTHON:\$PYTHONPATH" >> "$VENV_DIR/bin/activate"
+    if [ -f "$default_kine_cfg" ]; then
+        echo "export MARVIN_KINE_CONFIG=$default_kine_cfg" >> "$VENV_DIR/bin/activate"
+    fi
+}
+
+install_marvin_spacemouse_env() {
+    install_marvin_env
+    uv pip install "pyspacemouse>=2.0.0"
+}
+
+install_marvin_vr_env() {
+    install_marvin_env
+    install_xrobotoolkit_sdk
+    ensure_opencv_gui_backend
+}
+
+install_marvin_vr_hand_env() {
+    # Marvin arm SDK + PICO VR + BrainCo Revo2 dexterous hand.
+    install_marvin_vr_env
+    # Revo2 hand SDK (pure pip package; no native build like the arm SDK).
+    uv pip install "bc-stark-sdk>=1.4.2" "colorlog>=6.10.1"
 }
 
 install_robotwin_env() {
