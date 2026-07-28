@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+import copy
 import math
 import random
 from collections.abc import Sequence
@@ -91,6 +93,11 @@ class OpenPi0Config(Pi0Config):
         default_factory=lambda:(512,512)
     )
     qam_pool_mode: str = "mean_token"  # mean_token, last_token, first_token
+    # Residual policy: parameterize f_theta = f_beta + r_psi with a single shared
+    # frozen PaliGemma. The live action expert + projections act as the residual
+    # r_psi (zero-init at action_out_proj); a frozen deepcopy holds the behavior
+    # flow f_beta. Replaces the legacy two-full-model (f_theta / f_beta) design.
+    qam_residual: bool = False
 
     # ===== NFT-specific parameters =====
     is_nft: bool = False
@@ -263,10 +270,94 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 train_action_encoder=False,
             ).to(dtype=_qam_dtype)
 
+            if self.config.qam_residual:
+                self._build_qam_f_beta_branch()
+
         for name, module in self.named_modules():
             # Set _fsdp_wrap_name to the last part of the path (e.g., "model.action_in_proj" -> "action_in_proj")
             path_parts = name.split(".")
             setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
+
+    # ===== QAM residual policy (f_theta = f_beta + r_psi) =====
+
+    def _qam_residual_proj_names(self):
+        """Projection modules that, together with gemma_expert, form a branch.
+
+        These are the modules swapped in/out by ``_use_qam_f_beta`` and copied
+        when syncing f_beta from the live (SFT) weights. Matches ``freeze_vlm``'s
+        pi05/pi0 split.
+        """
+        if self.pi05:
+            return ["action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out"]
+        return [
+            "action_in_proj",
+            "action_out_proj",
+            "state_proj",
+            "action_time_mlp_in",
+            "action_time_mlp_out",
+        ]
+
+    def _build_qam_f_beta_branch(self):
+        """Build the frozen behavior branch f_beta as deepcopies of the live
+        action expert + projections. The single shared (frozen) PaliGemma prefix
+        is NOT copied; both branches consume the same prefix KV cache.
+
+        Weights here are random until ``sync_qam_f_beta_from_live()`` copies the
+        loaded SFT weights over (called by the worker after checkpoint load).
+        """
+        f_beta = torch.nn.Module()
+        f_beta.gemma_expert = copy.deepcopy(
+            self.paligemma_with_expert.gemma_expert
+        )
+        for proj_name in self._qam_residual_proj_names():
+            setattr(f_beta, proj_name, copy.deepcopy(getattr(self, proj_name)))
+        f_beta.requires_grad_(False)
+        f_beta.eval()
+        self.qam_f_beta = f_beta
+
+    @contextlib.contextmanager
+    def _use_qam_f_beta(self):
+        """Temporarily rebind the live expert + projections to the frozen f_beta
+        copies so the existing ``get_velocity`` path evaluates the behavior flow.
+        """
+        saved = {"gemma_expert": self.paligemma_with_expert.gemma_expert}
+        self.paligemma_with_expert.gemma_expert = self.qam_f_beta.gemma_expert
+        for proj_name in self._qam_residual_proj_names():
+            saved[proj_name] = getattr(self, proj_name)
+            setattr(self, proj_name, getattr(self.qam_f_beta, proj_name))
+        try:
+            yield
+        finally:
+            self.paligemma_with_expert.gemma_expert = saved.pop("gemma_expert")
+            for proj_name, module in saved.items():
+                setattr(self, proj_name, module)
+
+    @torch.no_grad()
+    def sync_qam_f_beta_from_live(self):
+        """Copy live (SFT-loaded) expert + projection weights into f_beta.
+
+        Call once after the SFT checkpoint is loaded and BEFORE
+        ``zero_init_qam_residual`` so f_beta captures the full behavior flow.
+        """
+        self.qam_f_beta.gemma_expert.load_state_dict(
+            self.paligemma_with_expert.gemma_expert.state_dict()
+        )
+        for proj_name in self._qam_residual_proj_names():
+            getattr(self.qam_f_beta, proj_name).load_state_dict(
+                getattr(self, proj_name).state_dict()
+            )
+        self.qam_f_beta.requires_grad_(False)
+        self.qam_f_beta.eval()
+
+    @torch.no_grad()
+    def zero_init_qam_residual(self):
+        """Zero the live residual output projection so r_psi = 0 at start
+        (=> f_theta = f_beta + 0 = f_beta). Gradient still flows through the
+        zeroed Linear, so the residual can learn away from zero.
+        """
+        self.action_out_proj.weight.zero_()
+        if self.action_out_proj.bias is not None:
+            self.action_out_proj.bias.zero_()
 
     def _obs_processor_for_qam(self, replay_obs):
         """Replay-side equivalent of obs_processor.
@@ -1191,6 +1282,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             for params in self.paligemma_with_expert.paligemma.parameters():
                 params.requires_grad = False
 
+            # QAM residual: the f_β behavior branch is always frozen.
+            if getattr(self.config, "qam_residual", False) and hasattr(
+                self, "qam_f_beta"
+            ):
+                self.qam_f_beta.eval()
+                for params in self.qam_f_beta.parameters():
+                    params.requires_grad = False
+
             # ========== DSRL additional freezing ==========
             if self.config.use_dsrl:
                 self.logger.info(
@@ -1262,14 +1361,24 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         x_t=None,
         timestep=None,
         data=None,
+        component="theta",
         **kwargs,
     ):
-        """Single-model velocity forward for QAM:  v_t = f(s, x_t, t).
+        """Velocity forward for QAM:  v_t = f(s, x_t, t).
 
-        Callers run this on the live (trainable) model to get vf_fine, and
-        independently on a second frozen instance (f_β, held by the QAM
-        actor worker — see EmbodiedQAMFSDPPolicy) to get vf_base. The actor
-        loss `(vf_fine - vf_base)·2/σ + σ·adj` is then assembled outside
+        Two modes, selected by ``component``:
+
+        * Legacy two-model design (``qam_residual=False``): this method returns
+          a single velocity field. The worker runs it on the live (trainable)
+          model to get vf_fine, and on a second frozen instance (f_β) to get
+          vf_base. ``component`` is ignored.
+        * Residual policy (``qam_residual=True``): a single shared frozen
+          PaliGemma feeds two experts within this instance —
+          ``component="beta"`` → f_β (frozen, no grad), ``component="theta"`` →
+          f_θ = f_β + r_ψ (grad flows only through the live residual r_ψ). The
+          prefix KV cache is computed once and reused by both experts.
+
+        The actor loss `(vf_fine - vf_base)·2/σ + σ·adj` is assembled outside
         this method. This matches the SAC target_model pattern already used
         in fsdp_sac_policy_worker.
 
@@ -1336,21 +1445,47 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # rlinf.algorithms.embodiment.qam stay in QAM coordinates.
         timestep_openpi = self._qam_to_openpi_flow_time(timestep)
 
-        # VLM frozen → no grad needs to reach PaliGemma.
+        # VLM frozen → no grad needs to reach PaliGemma. The prefix KV cache is
+        # expert-agnostic; in residual mode both experts reuse this single pass.
         with torch.no_grad():
             _, prefix_pad_masks, past_key_values = self._build_prefix_cache(
                 images, img_masks, lang_tokens, lang_masks
             )
 
-        # Action expert + projections — gradient flows here on the live model
-        # (trainable expert + projections). On the f_β model instance all
-        # params are requires_grad=False, so the gradient still won't
-        # accumulate even without an explicit no_grad context.
-        v_openpi, _ = self.get_velocity(
+        if not self.config.qam_residual:
+            # Legacy two-model path: gradient flows through the live model's
+            # expert + projections; on the frozen f_β instance all params are
+            # requires_grad=False so gradient won't accumulate anyway.
+            v_openpi, _ = self.get_velocity(
+                state, x_t, timestep_openpi, prefix_pad_masks, past_key_values
+            )
+            # v_OpenPI is dx/dt; QAM expects v_QAM = dx/dw = -v_OpenPI.
+            return -v_openpi
+
+        # Residual policy: f_θ = f_β + r_ψ from a single shared PaliGemma.
+        if component not in ("theta", "beta"):
+            raise ValueError(
+                f"qam_velocity_forward: unknown component {component!r}"
+            )
+
+        # f_β behavior flow — frozen expert branch, no grad.
+        with torch.no_grad(), self._use_qam_f_beta():
+            v_beta_openpi, _ = self.get_velocity(
+                state, x_t, timestep_openpi, prefix_pad_masks, past_key_values
+            )
+        v_beta = -v_beta_openpi  # OpenPI → QAM convention.
+
+        if component == "beta":
+            return v_beta
+
+        # r_ψ residual — live (trainable) expert branch; gradient flows here.
+        # action_out_proj is zero-init so r_ψ = 0 at start ⇒ f_θ = f_β.
+        v_res_openpi, _ = self.get_velocity(
             state, x_t, timestep_openpi, prefix_pad_masks, past_key_values
         )
-        # v_OpenPI is dx/dt; QAM expects v_QAM = dx/dw = -v_OpenPI.
-        return -v_openpi
+        v_res = -v_res_openpi
+        # Detach f_β so f_θ - f_β = r_ψ exactly (grad only through r_ψ).
+        return v_beta.detach() + v_res
 
     # ===== DSRL-specific methods =====
 
